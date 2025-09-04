@@ -1,0 +1,296 @@
+metadata:
+  name: "upgrade-test"
+  description: "Test OpenSearch cluster and operator upgrades"
+  version: "1.0.0"
+  author: "test-team"
+  tags: ["upgrade", "compatibility", "rolling-upgrade"]
+
+config:
+  kubernetes:
+    cluster_name: "opensearch-upgrade-test"
+    kubernetes_version: "v1.28.0"
+    nodes: 3
+    cleanup_on_failure: false
+    cleanup_on_success: true
+    provider: "kind"
+  
+  opensearch:
+    namespace: "opensearch-system"
+    operator_version: "2.3.0"  # Start with specific version
+    opensearch_version: "2.11.0"  # Upgrade from this version
+  
+  timeouts:
+    deployment: "15m"
+    upgrade: "30m"
+    scaling: "10m"
+    recovery: "25m"
+
+phases:
+  - name: "setup"
+    description: "Deploy initial cluster with older versions"
+    steps:
+      - action: setup_cluster
+        params:
+          provider: "kind"
+          nodes: 3
+      - action: install_operator
+        params:
+          version: "2.3.0"
+          namespace: "opensearch-system"
+          wait_timeout: "5m"
+      - action: deploy_cluster
+        params:
+          cluster_name: "upgrade-test-cluster"
+          namespace: "opensearch"
+          version: "2.11.0"
+          nodes:
+            master: 3
+            data: 2
+          storage:
+            class: "standard"
+            size: "15Gi"
+      - action: wait_for_cluster_ready
+        params:
+          timeout: "15m"
+      - action: update_cluster_allocation_settings
+        params:
+          allocation_enable: "all"
+
+  - name: "pre_upgrade_data"
+    description: "Index data before upgrade"
+    steps:
+      - action: index_documents
+        params:
+          count: 5000
+          index: "pre-upgrade-data"
+          bulk_size: 200
+          document_template: |
+            {
+              "id": {id},
+              "timestamp": "{timestamp}",
+              "version": "pre-upgrade",
+              "message": "Document created before upgrade {id}",
+              "category": "{random:A,B,C,D,E}",
+              "value": {id}
+            }
+      - action: create_snapshot
+        params:
+          repository: "upgrade-repo"
+          snapshot_name: "pre-upgrade-{timestamp}"
+          indices: ["pre-upgrade-data"]
+      - action: validate_data_integrity
+        params:
+          indices: ["pre-upgrade-data"]
+          expected_documents: 5000
+      - action: capture_metrics
+        params:
+          duration: "2m"
+          metrics: ["cluster_health", "node_stats", "index_stats"]
+          output_file: "pre-upgrade-metrics-{timestamp}.json"
+
+  - name: "opensearch_cluster_upgrade"
+    description: "Upgrade OpenSearch cluster version"
+    steps:
+      - action: upgrade_cluster
+        params:
+          target_version: "2.12.0"
+          strategy: "rolling"
+          max_unavailable: 1
+          validation_steps:
+            - "check_cluster_health"
+            - "validate_data_integrity"
+          rollback_on_failure: true
+          timeout: "30m"
+      - action: wait_for_cluster_ready
+        params:
+          timeout: "20m"
+          conditions:
+            - cluster_health: "green"
+            - all_nodes_ready: true
+
+  - name: "post_cluster_upgrade_validation"
+    description: "Validate cluster after OpenSearch upgrade"
+    steps:
+      - action: validate_cluster_health
+        params:
+          expected_status: "green"
+          timeout: "10m"
+          check_nodes: true
+          check_indices: true
+      - action: validate_data_integrity
+        params:
+          indices: ["pre-upgrade-data"]
+          expected_documents: 5000
+          checksum_validation: true
+      - action: query_documents
+        params:
+          index: "pre-upgrade-data"
+          query: '{"term": {"version": "pre-upgrade"}}'
+          expected_count: 5000
+      - action: index_documents
+        params:
+          count: 2000
+          index: "post-upgrade-data"
+          bulk_size: 200
+          document_template: |
+            {
+              "id": {id},
+              "timestamp": "{timestamp}",
+              "version": "post-cluster-upgrade",
+              "message": "Document created after cluster upgrade {id}",
+              "category": "{random:A,B,C,D,E}",
+              "value": {id}
+            }
+
+  - name: "operator_upgrade"
+    description: "Upgrade OpenSearch operator"
+    steps:
+      - action: upgrade_operator
+        params:
+          target_version: "2.4.0"
+          strategy: "recreate"
+          backup_before: true
+          timeout: "15m"
+      - action: validate_operator_status
+        params:
+          expected_phase: "Running"
+          check_events: true
+          max_restart_count: 0
+      - action: wait_for_cluster_ready
+        params:
+          timeout: "10m"
+
+  - name: "post_operator_upgrade_validation"
+    description: "Validate cluster after operator upgrade"
+    steps:
+      - action: validate_cluster_health
+        params:
+          expected_status: "green"
+          timeout: "10m"
+      - action: validate_data_integrity
+        params:
+          indices: ["pre-upgrade-data", "post-upgrade-data"]
+          expected_documents: 7000
+      - action: index_documents
+        params:
+          count: 1000
+          index: "post-operator-upgrade-data"
+          bulk_size: 100
+          document_template: |
+            {
+              "id": {id},
+              "timestamp": "{timestamp}",
+              "version": "post-operator-upgrade",
+              "message": "Document created after operator upgrade {id}",
+              "category": "{random:A,B,C,D,E}",
+              "value": {id}
+            }
+
+  - name: "upgrade_under_load"
+    description: "Test minor upgrade under load"
+    steps:
+      - action: index_documents
+        params:
+          count: 3000
+          index: "load-test-data"
+          bulk_size: 100
+          background: true  # Index in background during upgrade
+          document_template: |
+            {
+              "id": {id},
+              "timestamp": "{timestamp}",
+              "version": "under-load",
+              "message": "Document created during load test {id}",
+              "load_test": true,
+              "value": {id}
+            }
+      - action: upgrade_cluster
+        params:
+          target_version: "2.12.1"  # Minor version upgrade
+          strategy: "rolling"
+          max_unavailable: 1
+          timeout: "25m"
+      - action: wait_for_cluster_ready
+        params:
+          timeout: "15m"
+      - action: validate_data_integrity
+        params:
+          indices: ["*"]
+          expected_documents: 11000  # 5000 + 2000 + 1000 + 3000
+
+  - name: "rollback_test"
+    description: "Test rollback capability"
+    steps:
+      - action: create_snapshot
+        params:
+          repository: "upgrade-repo"
+          snapshot_name: "before-rollback-{timestamp}"
+          indices: ["*"]
+      # Simulate a problematic upgrade by trying to upgrade to non-existent version
+      - action: upgrade_cluster
+        params:
+          target_version: "2.99.0"  # This should fail
+          strategy: "rolling"
+          rollback_on_failure: true
+          timeout: "10m"
+      # After rollback, validate cluster is still functional
+      - action: validate_cluster_health
+        params:
+          expected_status: "green"
+          timeout: "10m"
+      - action: validate_data_integrity
+        params:
+          indices: ["*"]
+
+  - name: "comprehensive_validation"
+    description: "Final comprehensive validation"
+    steps:
+      - action: validate_cluster_health
+        params:
+          expected_status: "green"
+          timeout: "10m"
+          check_nodes: true
+          check_indices: true
+      - action: validate_operator_status
+        params:
+          expected_phase: "Running"
+          check_events: true
+      - action: query_documents
+        params:
+          index: "pre-upgrade-data"
+          query: '{"term": {"version": "pre-upgrade"}}'
+          expected_count: 5000
+      - action: query_documents
+        params:
+          index: "post-upgrade-data"
+          query: '{"term": {"version": "post-cluster-upgrade"}}'
+          expected_count: 2000
+      - action: query_documents
+        params:
+          index: "post-operator-upgrade-data"
+          query: '{"term": {"version": "post-operator-upgrade"}}'
+          expected_count: 1000
+      - action: capture_metrics
+        params:
+          duration: "3m"
+          metrics: ["cluster_health", "node_stats", "index_stats"]
+          output_file: "final-upgrade-metrics-{timestamp}.json"
+      - action: collect_logs
+        params:
+          components: ["operator", "opensearch-pods"]
+          since: "60m"
+          output_dir: "./logs/upgrade-test-{timestamp}"
+
+  - name: "cleanup"
+    description: "Clean up upgrade test resources"
+    steps:
+      - action: delete_cluster
+        params:
+          cluster_name: "upgrade-test-cluster"
+          namespace: "opensearch"
+          force: false
+          wait_for_completion: true
+      - action: cleanup_cluster
+        params:
+          remove_cluster: true
+          cleanup_docker: true

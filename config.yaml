@@ -1,0 +1,39 @@
+# Global configuration for OpenSearch Kubernetes Operator Test Harness
+# This configuration applies to all playbooks and can be overridden on a per-playbook basis
+
+kubernetes:
+  kubernetes_version: "v1.28.0"
+  nodes: 3
+  cleanup_on_failure: true
+  cleanup_on_success: true
+  provider: "existing"  # Supported providers: "kind" (default), "minikube", "existing"
+  cluster_name: "opensearch-test"
+
+timeouts:
+  deployment: "20m"
+  upgrade: "20m"
+  scaling: "20m"
+  recovery: "20m"
+
+# Optional: Default values for other common configuration sections
+opensearch:
+  # namespace: "opensearch-system"  # Commented out to allow random namespace generation
+  operator_version: "latest"
+  # opensearch_version: "2.11.0"  # Commented out to use "latest" tag by default
+  # Local operator development (leave empty to use upstream releases)
+  local_operator_path: "/Users/itamarsyn-hershko/code/opensearch-k8s-operator/opensearch-operator"  # Path to local operator source code
+
+  # Default resource configuration for OpenSearch nodes
+  node_resources:
+    requests:
+      cpu: "250m"        # Quarter core request
+      memory: "512Mi"    # Half GB request
+    limits:
+      cpu: "500m"        # Half core limit
+      memory: "1Gi"      # 1GB memory limit
+  jvm_heap: "-Xmx512m -Xms512m"  # JVM heap sized appropriately for 1GB limit
+
+data_validation:
+  document_count: 1000
+  index_pattern: "test-index-{timestamp}"
+  query_timeout: "30s"

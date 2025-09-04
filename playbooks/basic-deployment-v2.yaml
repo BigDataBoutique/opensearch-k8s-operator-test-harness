@@ -1,0 +1,148 @@
+metadata:
+  description: "Test basic OpenSearch v2 cluster deployment and operations"
+
+phases:
+  - name: "setup"
+    description: "Initialize test environment"
+    steps:
+      - action: setup_cluster
+        params:
+          nodes: 3
+          kubernetes_version: "v1.28.0"
+      - action: install_operator
+        params:
+          version: "latest"
+          namespace: "opensearch-system"
+
+  - name: "basic_deployment"
+    description: "Test basic cluster deployment"
+    steps:
+      - action: deploy_cluster
+        params:
+          cluster_name: "test-cluster"
+          version: "2.7.0"
+          dashboards:
+            enabled: false
+            replicas: 0
+            version: "2.7.0"
+          cluster_settings:
+            "cluster.routing.allocation.disk.watermark.low": "95%"
+            "cluster.routing.allocation.disk.watermark.high": "97%"
+            "cluster.routing.allocation.disk.watermark.flood_stage": "99%"
+          node_pools:
+            - component: "nodes"
+              roles: ["master", "data", "ingest"]
+              replicas: 3
+              resources:
+                requests:
+                  memory: "512Mi"
+                  cpu: "250m"
+                limits:
+                  memory: "1Gi"
+                  cpu: "500m"
+              jvm: "-Xmx512m -Xms512m"
+          storage:
+            class: "standard"
+            size: "10Gi"
+      - action: wait_for_cluster_ready
+        params:
+          conditions:
+            - cluster_health: "yellow"
+            - all_nodes_ready: true
+      - action: update_cluster_allocation_settings
+        params:
+          allocation_enable: "all"
+
+  - name: "validate_cluster"
+    description: "Validate cluster is ready and properly configured"
+    steps:
+      - action: validate_cluster_health
+        params:
+          expected_status: "green"
+          check_nodes: true
+          check_indices: true
+      - action: validate_cluster_configuration
+        params:
+          total_nodes:
+            expected: 3
+          node_role_distribution:
+            master:
+              minimum: 3
+              maximum: 3
+            data:
+              minimum: 3
+              maximum: 3
+
+  - name: "data_operations"
+    description: "Test data indexing and querying"
+    steps:
+      - action: index_documents
+        params:
+          count: 1000
+          index: "test-data-{timestamp}"
+          bulk_size: 100
+          replicas: 2
+          shards: 1
+          document_template: |
+            {
+              "id": {id},
+              "timestamp": "{timestamp}",
+              "version": "2.7",
+              "message": "Test document {id}",
+              "level": "{random:INFO,WARN,ERROR}",
+              "service": "{random:web,api,db}",
+              "value": {id},
+              "nested_data": {
+                "sub_field": "nested_value_{id}",
+                "numeric_field": {id}
+              }
+            }
+      - action: validate_data_integrity
+        params:
+          indices: ["test-data-*"]
+          expected_documents: 1000
+          checksum_validation: true
+          sample_queries:
+            - query: '{"match_all": {}}'
+              expected_hits: 1000
+            - query: '{"term": {"level": "ERROR"}}'
+              min_hits: 50
+            - query: '{"term": {"version": "2.7"}}'
+              expected_hits: 1000
+      - action: query_documents
+        params:
+          index: "test-data-*"
+          query: '{"match_all": {}}'
+          expected_count: 1000
+
+  - name: "validation"
+    description: "Final validation of cluster state"
+    steps:
+      - action: validate_cluster_health
+        params:
+          expected_status: "green"
+          check_nodes: true
+          check_indices: true
+      - action: validate_operator_status
+        params:
+          expected_phase: "Running"
+          check_events: true
+          max_restart_count: 0
+      - action: validate_node_configuration
+        params:
+          node_group: "all"
+          vm_max_map_count: 262144
+      - action: validate_cluster_configuration
+        params:
+          total_nodes:
+            expected: 3
+          node_role_distribution:
+            master:
+              minimum: 3
+              maximum: 3
+            data:
+              minimum: 3
+              maximum: 3
+            ingest:
+              minimum: 3
+              maximum: 3

@@ -1,0 +1,108 @@
+metadata:
+  description: "5-node basic OpenSearch cluster - all nodes master+data+ingest"
+
+config:
+  kubernetes:
+    cluster_name: "opensearch-5node-basic"
+    nodes: 5
+
+
+phases:
+  - name: "setup"
+    description: "Deploy 5-node basic cluster"
+    steps:
+      - action: setup_cluster
+        params:
+          nodes: 5
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          cluster_name: "basic-5node-cluster"
+          version: "2.17.0"
+          storage:
+            class: "standard"
+            size: "10Gi"
+          dashboards:
+            enabled: false
+          node_pools:
+            - component: "nodes"
+              roles: ["cluster_manager", "data", "ingest"]
+              replicas: 5
+              jvm: "-Xmx1g -Xms1g"
+      - action: wait_for_cluster_ready
+        params:
+          conditions:
+            - cluster_health: "yellow"
+            - all_nodes_ready: true
+      - action: update_cluster_allocation_settings
+        params:
+          allocation_enable: "all"
+
+  - name: "validate_topology"
+    description: "Validate 5-node cluster topology"
+    steps:
+      - action: validate_cluster_health
+        params:
+          expected_status: "green"
+          check_nodes: true
+          check_indices: true
+      - action: validate_cluster_configuration
+        params:
+          node_role_distribution:
+            cluster_manager:
+              minimum: 5
+              maximum: 5
+            data:
+              minimum: 5
+              maximum: 5
+            ingest:
+              minimum: 5
+              maximum: 5
+          cluster_settings:
+            "cluster.max_shards_per_node":
+              type: "minimum"
+              minimum: 100
+
+  - name: "data_validation"
+    description: "Test data operations with higher replica count"
+    steps:
+      - action: index_documents
+        params:
+          count: 2000
+          index: "basic-5node-test"
+          bulk_size: 100
+          replicas: 2
+          shards: 5
+          document_template: |
+            {
+              "id": {id},
+              "timestamp": "{timestamp}",
+              "cluster_type": "5-node-basic",
+              "message": "Test document for 5-node basic cluster - {id}",
+              "value": {id},
+              "replica_test": true
+            }
+      - action: validate_data_integrity
+        params:
+          indices: ["basic-5node-test"]
+          expected_documents: 2000
+          sample_queries:
+            - query: '{"match_all": {}}'
+              expected_hits: 2000
+            - query: '{"term": {"cluster_type": "5-node-basic"}}'
+              expected_hits: 2000
+            - query: '{"term": {"replica_test": true}}'
+              expected_hits: 2000
+
+  - name: "cleanup"
+    description: "Clean up resources"
+    steps:
+      - action: delete_cluster
+        params:
+          cluster_name: "basic-5node-cluster"
+          force: false
+          wait_for_completion: true
+      - action: cleanup_cluster
+        params:
+          remove_cluster: true
+          cleanup_docker: true

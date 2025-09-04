@@ -1,0 +1,113 @@
+metadata:
+  description: "3-node basic OpenSearch cluster - all nodes master+data+ingest"
+
+config:
+  kubernetes:
+    cluster_name: "opensearch-3node-basic"
+    nodes: 3
+
+phases:
+  - name: "setup"
+    description: "Deploy 3-node basic cluster"
+    steps:
+      - action: setup_cluster
+        params:
+          provider: "kind"
+          nodes: 3
+          kubernetes_version: "v1.28.0"
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          cluster_name: "basic-cluster"
+          version: "2.17.0"
+          storage:
+            class: "standard"
+            size: "10Gi"
+          dashboards:
+            enabled: false
+          node_pools:
+            - component: "nodes"
+              roles: ["cluster_manager", "data", "ingest"]
+              replicas: 3
+              resources:
+                requests:
+                  memory: "1Gi"
+                  cpu: "500m"
+                limits:
+                  memory: "2Gi"
+                  cpu: "1000m"
+              jvm: "-Xmx1g -Xms1g"
+      - action: wait_for_cluster_ready
+        params:
+          conditions:
+            - cluster_health: "green"
+            - all_nodes_ready: true
+      - action: update_cluster_allocation_settings
+        params:
+          allocation_enable: "all"
+
+  - name: "validate_topology"
+    description: "Validate 3-node cluster topology"
+    steps:
+      - action: validate_cluster_health
+        params:
+          expected_status: "green"
+          check_nodes: true
+          check_indices: true
+      - action: validate_cluster_configuration
+        params:
+          node_role_distribution:
+            cluster_manager:
+              minimum: 3
+              maximum: 3
+            data:
+              minimum: 3
+              maximum: 3
+            ingest:
+              minimum: 3
+              maximum: 3
+          cluster_settings:
+            "cluster.max_shards_per_node":
+              type: "minimum"
+              minimum: 100
+
+  - name: "data_validation"
+    description: "Test data operations on 3-node cluster"
+    steps:
+      - action: index_documents
+        params:
+          count: 1000
+          index: "basic-test"
+          bulk_size: 100
+          replicas: 1
+          shards: 3
+          document_template: |
+            {
+              "id": {id},
+              "timestamp": "{timestamp}",
+              "cluster_type": "3-node-basic",
+              "message": "Test document for 3-node basic cluster - {id}",
+              "value": {id}
+            }
+      - action: validate_data_integrity
+        params:
+          indices: ["basic-test"]
+          expected_documents: 1000
+          sample_queries:
+            - query: '{"match_all": {}}'
+              expected_hits: 1000
+            - query: '{"term": {"cluster_type": "3-node-basic"}}'
+              expected_hits: 1000
+
+  - name: "cleanup"
+    description: "Clean up resources"
+    steps:
+      - action: delete_cluster
+        params:
+          cluster_name: "basic-cluster"
+          force: false
+          wait_for_completion: true
+      - action: cleanup_cluster
+        params:
+          remove_cluster: true
+          cleanup_docker: true

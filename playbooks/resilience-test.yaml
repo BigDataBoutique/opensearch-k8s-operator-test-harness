@@ -1,0 +1,279 @@
+metadata:
+  name: "resilience-test"
+  description: "Test cluster resilience under various failure conditions"
+  version: "1.0.0"
+  author: "test-team"
+  tags: ["resilience", "chaos", "failure-recovery"]
+
+config:
+  kubernetes:
+    cluster_name: "opensearch-resilience-test"
+    kubernetes_version: "v1.28.0"
+    nodes: 4
+    cleanup_on_failure: false  # Keep cluster for investigation
+    cleanup_on_success: true
+    provider: "kind"
+  
+  opensearch:
+    namespace: "opensearch-system"
+    operator_version: "latest"
+    opensearch_version: "2.11.0"
+  
+  timeouts:
+    deployment: "15m"
+    upgrade: "20m"
+    scaling: "10m"
+    recovery: "30m"
+  
+  data_validation:
+    document_count: 10000
+    index_pattern: "resilience-data-{timestamp}"
+    query_timeout: "30s"
+
+phases:
+  - name: "setup"
+    description: "Initialize resilience test environment"
+    steps:
+      - action: setup_cluster
+        params:
+          provider: "kind"
+          nodes: 4
+          kubernetes_version: "v1.28.0"
+      - action: install_operator
+        params:
+          version: "latest"
+          namespace: "opensearch-system"
+          wait_timeout: "5m"
+      - action: deploy_cluster
+        params:
+          cluster_name: "resilience-cluster"
+          namespace: "opensearch"
+          version: "2.11.0"
+          nodes:
+            master: 3
+            data: 3
+          storage:
+            class: "standard"
+            size: "20Gi"
+      - action: wait_for_cluster_ready
+        params:
+          timeout: "15m"
+      - action: update_cluster_allocation_settings
+        params:
+          allocation_enable: "all"
+      - action: index_documents
+        params:
+          count: 10000
+          index: "resilience-data-{timestamp}"
+          bulk_size: 200
+          document_template: |
+            {
+              "id": {id},
+              "timestamp": "{timestamp}",
+              "message": "Resilience test document {id}",
+              "level": "{random:INFO,WARN,ERROR,DEBUG}",
+              "service": "{random:web,api,db,cache,queue}",
+              "value": {id},
+              "payload": "Lorem ipsum dolor sit amet, consectetur adipiscing elit"
+            }
+
+  - name: "baseline_validation"
+    description: "Establish baseline before chaos testing"
+    steps:
+      - action: create_snapshot
+        params:
+          repository: "test-repo"
+          snapshot_name: "baseline-{timestamp}"
+          indices: ["resilience-data-*"]
+      - action: validate_cluster_health
+        params:
+          expected_status: "green"
+          timeout: "5m"
+      - action: capture_metrics
+        params:
+          duration: "2m"
+          metrics: ["cluster_health", "node_stats", "index_stats"]
+          output_file: "baseline-metrics-{timestamp}.json"
+
+  - name: "pod_failure_test"
+    description: "Test recovery from pod failures"
+    steps:
+      - action: inject_pod_failure
+        params:
+          target: "data-nodes"
+          count: 1
+          method: "delete"
+          recovery_wait: "30s"
+      - action: wait_for_cluster_ready
+        params:
+          timeout: "10m"
+          conditions:
+            - cluster_health: "yellow"  # Allow yellow during recovery
+            - all_nodes_ready: true
+      - action: validate_data_integrity
+        params:
+          indices: ["resilience-data-*"]
+          expected_documents: 10000
+          sample_queries:
+            - query: '{"match_all": {}}'
+              expected_hits: 10000
+      - action: validate_cluster_health
+        params:
+          expected_status: "green"
+          timeout: "15m"
+
+  - name: "multiple_pod_failure_test"
+    description: "Test recovery from multiple pod failures"
+    steps:
+      - action: inject_pod_failure
+        params:
+          target: "data-nodes"
+          count: 2
+          method: "delete"
+          recovery_wait: "1m"
+      - action: wait_for_cluster_ready
+        params:
+          timeout: "20m"
+          conditions:
+            - cluster_health: "yellow"
+            - all_nodes_ready: true
+      - action: validate_data_integrity
+        params:
+          indices: ["resilience-data-*"]
+          expected_documents: 10000
+
+  - name: "network_partition_test"
+    description: "Test recovery from network partitions"
+    steps:
+      - action: inject_network_partition
+        params:
+          target: "master-nodes"
+          duration: "2m"
+          partition_type: "isolate"
+          chaos_tool: "chaos-mesh"
+      - action: wait_for_cluster_ready
+        params:
+          timeout: "15m"
+      - action: validate_cluster_health
+        params:
+          expected_status: "green"
+          timeout: "10m"
+      - action: validate_data_integrity
+        params:
+          indices: ["resilience-data-*"]
+          expected_documents: 10000
+
+  - name: "resource_pressure_test"
+    description: "Test behavior under resource pressure"
+    steps:
+      - action: inject_resource_pressure
+        params:
+          target: "data-nodes"
+          resource: "memory"
+          limit: "90%"
+          duration: "3m"
+      - action: validate_cluster_health
+        params:
+          expected_status: "yellow"  # Cluster may degrade under pressure
+          timeout: "5m"
+      - action: wait_for_cluster_ready
+        params:
+          timeout: "20m"  # Allow time for recovery
+      - action: validate_data_integrity
+        params:
+          indices: ["resilience-data-*"]
+          expected_documents: 10000
+
+  - name: "rolling_restart_test"
+    description: "Test rolling restart resilience"
+    steps:
+      - action: inject_pod_failure
+        params:
+          target: "all-nodes"
+          count: 1
+          method: "delete"
+          recovery_wait: "2m"
+      - action: inject_pod_failure
+        params:
+          target: "all-nodes"
+          count: 1
+          method: "delete"
+          recovery_wait: "2m"
+      - action: inject_pod_failure
+        params:
+          target: "all-nodes"
+          count: 1
+          method: "delete"
+          recovery_wait: "2m"
+      - action: wait_for_cluster_ready
+        params:
+          timeout: "20m"
+      - action: validate_data_integrity
+        params:
+          indices: ["resilience-data-*"]
+          expected_documents: 10000
+
+  - name: "load_under_failure"
+    description: "Test indexing during failures"
+    steps:
+      - action: index_documents
+        params:
+          count: 2000
+          index: "stress-data-{timestamp}"
+          bulk_size: 100
+          background: true
+      - action: inject_pod_failure
+        params:
+          target: "data-nodes"
+          count: 1
+          method: "delete"
+          recovery_wait: "1m"
+      - action: wait_for_cluster_ready
+        params:
+          timeout: "15m"
+      - action: validate_data_integrity
+        params:
+          indices: ["resilience-data-*", "stress-data-*"]
+          expected_documents: 12000
+
+  - name: "final_validation"
+    description: "Comprehensive validation after all chaos tests"
+    steps:
+      - action: validate_cluster_health
+        params:
+          expected_status: "green"
+          timeout: "10m"
+          check_nodes: true
+          check_indices: true
+      - action: validate_data_integrity
+        params:
+          indices: ["*"]
+          checksum_validation: true
+      - action: query_documents
+        params:
+          index: "*"
+          query: '{"match_all": {}}'
+      - action: capture_metrics
+        params:
+          duration: "2m"
+          metrics: ["cluster_health", "node_stats", "index_stats"]
+          output_file: "final-metrics-{timestamp}.json"
+      - action: collect_logs
+        params:
+          components: ["operator", "opensearch-pods", "events"]
+          since: "30m"
+          output_dir: "./logs/resilience-test-{timestamp}"
+
+  - name: "cleanup"
+    description: "Clean up resilience test resources"
+    steps:
+      - action: delete_cluster
+        params:
+          cluster_name: "resilience-cluster"
+          namespace: "opensearch"
+          force: false
+          wait_for_completion: true
+      - action: cleanup_cluster
+        params:
+          remove_cluster: true
+          cleanup_docker: true
