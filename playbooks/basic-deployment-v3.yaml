@@ -131,7 +131,6 @@ phases:
       - action: validate_node_configuration
         params:
           node_group: "all"
-          vm_max_map_count: 262144
       - action: validate_cluster_configuration
         params:
           total_nodes:

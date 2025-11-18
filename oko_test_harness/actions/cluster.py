@@ -511,25 +511,26 @@ class InstallOperatorAction(BaseAction):
             os.chdir(local_path)
 
             try:
-                # Check if we're in a Kind cluster (different approach needed for Kind)
-                kind_cluster_result = subprocess.run(
+                # Check cluster type (Kind and k3d need image loading instead of registry push)
+                context_result = subprocess.run(
                     ["kubectl", "config", "current-context"],
                     capture_output=True,
                     text=True,
                 )
-                is_kind_cluster = (
-                    kind_cluster_result.returncode == 0
-                    and "kind-" in kind_cluster_result.stdout
-                )
+                if context_result.returncode == 0:
+                    context = context_result.stdout.strip()
+                    if "kind-" in context:
+                        return self._install_local_operator_kind(
+                            local_path, namespace, timeout
+                        )
+                    elif "k3d-" in context:
+                        return self._install_local_operator_k3d(
+                            local_path, namespace, timeout
+                        )
 
-                if is_kind_cluster:
-                    return self._install_local_operator_kind(
-                        local_path, namespace, timeout
-                    )
-                else:
-                    return self._install_local_operator_standard(
-                        local_path, namespace, timeout
-                    )
+                return self._install_local_operator_standard(
+                    local_path, namespace, timeout
+                )
 
             finally:
                 os.chdir(original_dir)
@@ -607,6 +608,78 @@ class InstallOperatorAction(BaseAction):
             return ActionResult(False, "Timeout building or deploying local operator")
         except Exception as e:
             return ActionResult(False, f"Error installing local operator in Kind: {e}")
+
+    def _install_local_operator_k3d(
+        self, local_path: str, namespace: str, timeout: str
+    ) -> ActionResult:
+        """Install local operator in k3d cluster (requires loading image into k3d)."""
+        try:
+            # Get current k3d cluster name from context
+            context_result = subprocess.run(
+                ["kubectl", "config", "current-context"], capture_output=True, text=True
+            )
+            if context_result.returncode != 0:
+                return ActionResult(False, "Failed to get current kubectl context")
+
+            # Extract cluster name: k3d-<cluster-name> -> <cluster-name>
+            cluster_name = context_result.stdout.strip().replace("k3d-", "")
+            image_tag = "opensearch-operator:dev-local"
+
+            self.logger.debug(
+                f"Building operator image for k3d cluster: {cluster_name}"
+            )
+
+            # Build the operator image
+            build_result = subprocess.run(
+                ["make", "docker-build", f"IMG={image_tag}"],
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+
+            if build_result.returncode != 0:
+                return ActionResult(
+                    False, f"Failed to build operator image: {build_result.stderr}"
+                )
+
+            self.logger.info("Loading operator image into k3d cluster...")
+
+            # Load image into k3d cluster
+            load_result = subprocess.run(
+                ["k3d", "image", "import", image_tag, "--cluster", cluster_name],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+
+            if load_result.returncode != 0:
+                return ActionResult(
+                    False, f"Failed to load image into k3d: {load_result.stderr}"
+                )
+
+            # Deploy the operator with the specified namespace
+            self.logger.info(f"Deploying operator to namespace {namespace}...")
+            deploy_result = subprocess.run(
+                ["make", "deploy", f"IMG={image_tag}", f"NAMESPACE={namespace}"],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+
+            if deploy_result.returncode != 0:
+                return ActionResult(
+                    False, f"Failed to deploy operator: {deploy_result.stderr}"
+                )
+
+            self.logger.debug(
+                f"Local operator installed successfully in k3d cluster (namespace: {namespace})"
+            )
+            return ActionResult(True, f"Local operator installed from {local_path}")
+
+        except subprocess.TimeoutExpired:
+            return ActionResult(False, "Timeout building or deploying local operator")
+        except Exception as e:
+            return ActionResult(False, f"Error installing local operator in k3d: {e}")
 
     def _install_local_operator_standard(
         self, local_path: str, namespace: str, timeout: str
@@ -800,7 +873,7 @@ spec:
     vendor: opensearch
     version: {version}
     serviceName: {name}
-    setVMMaxMapCount: true"""
+    setVMMaxMapCount: false"""
 
         # Add cluster settings if provided
         if cluster_settings:
