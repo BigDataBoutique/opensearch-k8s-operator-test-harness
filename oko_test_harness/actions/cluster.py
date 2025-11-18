@@ -580,8 +580,8 @@ class InstallOperatorAction(BaseAction):
                     False, f"Failed to load image into Kind: {load_result.stderr}"
                 )
 
-            # Deploy the operator
-            self.logger.info("Deploying operator to cluster...")
+            # Deploy the operator with the specified namespace
+            self.logger.info(f"Deploying operator to namespace {namespace}...")
             deploy_result = subprocess.run(
                 ["make", "deploy", f"IMG={image_tag}", f"NAMESPACE={namespace}"],
                 capture_output=True,
@@ -594,7 +594,9 @@ class InstallOperatorAction(BaseAction):
                     False, f"Failed to deploy operator: {deploy_result.stderr}"
                 )
 
-            self.logger.debug("Local operator installed successfully in Kind cluster")
+            self.logger.debug(
+                f"Local operator installed successfully in Kind cluster (namespace: {namespace})"
+            )
             return ActionResult(True, f"Local operator installed from {local_path}")
 
         except subprocess.TimeoutExpired:
@@ -647,8 +649,8 @@ class InstallOperatorAction(BaseAction):
                         f"Failed to push image {image_tag}, assuming local registry: {push_result.stderr}"
                     )
 
-            # Deploy the operator
-            self.logger.info("Deploying operator to cluster...")
+            # Deploy the operator with the specified namespace
+            self.logger.info(f"Deploying operator to namespace {namespace}...")
             deploy_result = subprocess.run(
                 ["make", "deploy", f"IMG={image_tag}", f"NAMESPACE={namespace}"],
                 capture_output=True,
@@ -661,7 +663,9 @@ class InstallOperatorAction(BaseAction):
                     False, f"Failed to deploy operator: {deploy_result.stderr}"
                 )
 
-            self.logger.debug("Local operator installed successfully")
+            self.logger.debug(
+                f"Local operator installed successfully (namespace: {namespace})"
+            )
             return ActionResult(True, f"Local operator installed from {local_path}")
 
         except subprocess.TimeoutExpired:
@@ -1405,88 +1409,88 @@ class UpdateClusterAllocationSettingsAction(BaseAction):
             f"Updating cluster allocation settings (enable: {allocation_enable})"
         )
 
-        try:
-            from oko_test_harness.utils.opensearch_client import (
-                KubernetesOpenSearchClient,
+        # Build settings to update
+        settings_data = {"transient": {}}
+        settings_data["transient"]["cluster.routing.allocation.enable"] = (
+            allocation_enable
+        )
+
+        if disk_watermarks:
+            if "low" in disk_watermarks:
+                settings_data["transient"][
+                    "cluster.routing.allocation.disk.watermark.low"
+                ] = disk_watermarks["low"]
+            if "high" in disk_watermarks:
+                settings_data["transient"][
+                    "cluster.routing.allocation.disk.watermark.high"
+                ] = disk_watermarks["high"]
+            if "flood_stage" in disk_watermarks:
+                settings_data["transient"][
+                    "cluster.routing.allocation.disk.watermark.flood_stage"
+                ] = disk_watermarks["flood_stage"]
+
+        if concurrent_recoveries is not None:
+            settings_data["transient"][
+                "cluster.routing.allocation.node_concurrent_recoveries"
+            ] = concurrent_recoveries
+
+        if recovery_speed is not None:
+            settings_data["transient"]["indices.recovery.max_bytes_per_sec"] = (
+                recovery_speed
             )
 
-            client = KubernetesOpenSearchClient.from_security_config(
-                self.config.opensearch.security, namespace, cluster_name
+        if allow_rebalance is not None:
+            settings_data["transient"]["cluster.routing.rebalance.enable"] = (
+                allow_rebalance
             )
 
-            with client:
-                # Build settings to update
-                settings_data = {"transient": {}}
+        # Retry logic for transient connection failures during rolling upgrades
+        import time
+        from oko_test_harness.utils.opensearch_client import KubernetesOpenSearchClient
 
-                # Set allocation enable setting
-                settings_data["transient"]["cluster.routing.allocation.enable"] = (
-                    allocation_enable
+        max_retries = 5
+        retry_delay = 10
+
+        for attempt in range(max_retries):
+            try:
+                client = KubernetesOpenSearchClient.from_security_config(
+                    self.config.opensearch.security, namespace, cluster_name
                 )
 
-                # Set disk watermarks if provided
-                if disk_watermarks:
-                    if "low" in disk_watermarks:
-                        settings_data["transient"][
-                            "cluster.routing.allocation.disk.watermark.low"
-                        ] = disk_watermarks["low"]
-                    if "high" in disk_watermarks:
-                        settings_data["transient"][
-                            "cluster.routing.allocation.disk.watermark.high"
-                        ] = disk_watermarks["high"]
-                    if "flood_stage" in disk_watermarks:
-                        settings_data["transient"][
-                            "cluster.routing.allocation.disk.watermark.flood_stage"
-                        ] = disk_watermarks["flood_stage"]
+                with client:
+                    if client.update_cluster_settings(settings_data):
+                        time.sleep(2)
+                        current_settings = client.get_cluster_settings()
+                        current_enable = (
+                            current_settings.get("transient", {})
+                            .get("cluster", {})
+                            .get("routing", {})
+                            .get("allocation", {})
+                            .get("enable")
+                        )
+                        self.logger.info(
+                            f"Verified allocation settings - enable: {current_enable}"
+                        )
+                        return ActionResult(
+                            True,
+                            f"Cluster allocation settings updated successfully (enable: {allocation_enable})",
+                        )
+                    else:
+                        return ActionResult(
+                            False, "Failed to update cluster allocation settings"
+                        )
 
-                # Set concurrent recoveries if provided
-                if concurrent_recoveries is not None:
-                    settings_data["transient"][
-                        "cluster.routing.allocation.node_concurrent_recoveries"
-                    ] = concurrent_recoveries
-
-                # Set recovery speed if provided
-                if recovery_speed is not None:
-                    settings_data["transient"]["indices.recovery.max_bytes_per_sec"] = (
-                        recovery_speed
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    self.logger.warning(
+                        f"Connection attempt {attempt + 1} failed: {e}, retrying in {retry_delay}s..."
                     )
-
-                # Set allow rebalance if provided
-                if allow_rebalance is not None:
-                    settings_data["transient"]["cluster.routing.rebalance.enable"] = (
-                        allow_rebalance
-                    )
-
-                # Update cluster settings
-                if client.update_cluster_settings(settings_data):
-                    # Verify settings were applied
-                    import time
-
-                    time.sleep(2)
-                    current_settings = client.get_cluster_settings()
-                    current_enable = (
-                        current_settings.get("transient", {})
-                        .get("cluster", {})
-                        .get("routing", {})
-                        .get("allocation", {})
-                        .get("enable")
-                    )
-                    self.logger.info(
-                        f"Verified allocation settings - enable: {current_enable}"
-                    )
-
-                    return ActionResult(
-                        True,
-                        f"Cluster allocation settings updated successfully (enable: {allocation_enable})",
-                    )
+                    time.sleep(retry_delay)
                 else:
                     return ActionResult(
-                        False, "Failed to update cluster allocation settings"
+                        False,
+                        f"Error updating cluster allocation settings after {max_retries} attempts: {e}",
                     )
-
-        except Exception as e:
-            return ActionResult(
-                False, f"Error updating cluster allocation settings: {e}"
-            )
 
 
 class DeleteClusterAction(BaseAction):

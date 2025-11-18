@@ -32,46 +32,65 @@ class IndexDocumentsAction(BaseAction):
 
         self.logger.info(f"Indexing {count} documents to index '{index}'")
 
-        try:
-            client = KubernetesOpenSearchClient.from_security_config(
-                self.config.opensearch.security, namespace, service_name
-            )
-            with client:
-                # Delete and recreate index to ensure proper mapping
-                try:
-                    client.delete_index(index)
-                    self.logger.info(
-                        f"Deleted existing index '{index}' to ensure clean mapping"
+        # Generate documents once before retry loop
+        documents = self._generate_documents(count, document_template)
+
+        # Log first few documents for debugging
+        if len(documents) > 0:
+            self.logger.info(f"Sample documents to be indexed: {documents[:3]}")
+
+        # Retry logic for transient connection failures
+        max_retries = 5
+        retry_delay = 10
+
+        for attempt in range(max_retries):
+            try:
+                client = KubernetesOpenSearchClient.from_security_config(
+                    self.config.opensearch.security, namespace, service_name
+                )
+                with client:
+                    # Delete and recreate index to ensure proper mapping (only on first attempt)
+                    if attempt == 0:
+                        try:
+                            client.delete_index(index)
+                            self.logger.info(
+                                f"Deleted existing index '{index}' to ensure clean mapping"
+                            )
+                        except Exception:
+                            pass  # Index might not exist, which is fine
+
+                        # Create index with proper mapping and configurable replicas
+                        if not client.create_index(
+                            index, replicas=replicas, shards=shards
+                        ):
+                            return ActionResult(
+                                False, f"Failed to create index '{index}'"
+                            )
+
+                    # Index documents
+                    successful, failed = client.bulk_index(index, documents, bulk_size)
+
+                    if failed == 0:
+                        return ActionResult(
+                            True, f"Successfully indexed {successful} documents"
+                        )
+                    else:
+                        return ActionResult(
+                            successful > failed,
+                            f"Indexed {successful} documents, {failed} failed",
+                        )
+
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    self.logger.warning(
+                        f"Index documents attempt {attempt + 1} failed: {e}, retrying in {retry_delay}s..."
                     )
-                except Exception:
-                    pass  # Index might not exist, which is fine
-
-                # Create index with proper mapping and configurable replicas
-                if not client.create_index(index, replicas=replicas, shards=shards):
-                    return ActionResult(False, f"Failed to create index '{index}'")
-
-                # Generate documents
-                documents = self._generate_documents(count, document_template)
-
-                # Log first few documents for debugging
-                if len(documents) > 0:
-                    self.logger.info(f"Sample documents to be indexed: {documents[:3]}")
-
-                # Index documents
-                successful, failed = client.bulk_index(index, documents, bulk_size)
-
-                if failed == 0:
-                    return ActionResult(
-                        True, f"Successfully indexed {successful} documents"
-                    )
+                    time.sleep(retry_delay)
                 else:
                     return ActionResult(
-                        successful > failed,
-                        f"Indexed {successful} documents, {failed} failed",
+                        False,
+                        f"Failed to index documents after {max_retries} attempts: {e}",
                     )
-
-        except Exception as e:
-            return ActionResult(False, f"Failed to index documents: {e}")
 
     def _generate_documents(
         self, count: int, template: str = None
@@ -141,30 +160,47 @@ class QueryDocumentsAction(BaseAction):
 
         self.logger.info(f"Querying index '{index}'")
 
-        try:
-            client = KubernetesOpenSearchClient.from_security_config(
-                self.config.opensearch.security, namespace, service_name
-            )
-            with client:
-                # Execute search
-                result = client.search(index, query, size=0)  # Just get count
-                hit_count = result["hits"]["total"]["value"]
+        # Retry logic for transient connection failures
+        max_retries = 5
+        retry_delay = 10
 
-                if expected_count is not None:
-                    if hit_count == expected_count:
-                        return ActionResult(
-                            True, f"Query returned {hit_count} documents as expected"
-                        )
+        for attempt in range(max_retries):
+            try:
+                client = KubernetesOpenSearchClient.from_security_config(
+                    self.config.opensearch.security, namespace, service_name
+                )
+                with client:
+                    # Execute search
+                    result = client.search(index, query, size=0)  # Just get count
+                    hit_count = result["hits"]["total"]["value"]
+
+                    if expected_count is not None:
+                        if hit_count == expected_count:
+                            return ActionResult(
+                                True,
+                                f"Query returned {hit_count} documents as expected",
+                            )
+                        else:
+                            return ActionResult(
+                                False,
+                                f"Expected {expected_count} documents, got {hit_count}",
+                            )
                     else:
                         return ActionResult(
-                            False,
-                            f"Expected {expected_count} documents, got {hit_count}",
+                            True, f"Query returned {hit_count} documents"
                         )
-                else:
-                    return ActionResult(True, f"Query returned {hit_count} documents")
 
-        except Exception as e:
-            return ActionResult(False, f"Failed to query documents: {e}")
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    self.logger.warning(
+                        f"Query documents attempt {attempt + 1} failed: {e}, retrying in {retry_delay}s..."
+                    )
+                    time.sleep(retry_delay)
+                else:
+                    return ActionResult(
+                        False,
+                        f"Failed to query documents after {max_retries} attempts: {e}",
+                    )
 
 
 class CreateSnapshotAction(BaseAction):

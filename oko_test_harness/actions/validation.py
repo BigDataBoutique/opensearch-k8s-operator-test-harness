@@ -26,121 +26,108 @@ class ValidateClusterHealthAction(BaseAction):
         namespace = params.get("namespace", self.config.opensearch.operator_namespace)
         service_name = params.get("service_name", self.config.opensearch.service_name)
 
-        # Parse timeout
         timeout = self._parse_duration(timeout_str)
         interval = self._parse_duration(retry_interval)
 
         self.logger.info(f"Validating cluster health (expecting {expected_status})")
 
-        # Use a single client connection with retry logic
         start_time = time.time()
         client = None
+        last_status = None
 
-        try:
-            # Establish connection once with retries
-            connection_attempts = 0
-            max_connection_attempts = 3
+        # Reconnect on each attempt - handles pod restarts during rolling upgrades
+        while time.time() - start_time < timeout:
+            try:
+                # Disconnect previous client if exists
+                if client:
+                    try:
+                        client.disconnect()
+                    except Exception:
+                        pass
+                    client = None
 
-            while connection_attempts < max_connection_attempts:
-                connection_attempts += 1
-                try:
-                    client = KubernetesOpenSearchClient.from_security_config(
-                        self.config.opensearch.security, namespace, service_name
-                    )
-                    if client.connect(
-                        quiet=(connection_attempts < max_connection_attempts)
-                    ):
-                        self.logger.info("Successfully connected to OpenSearch cluster")
-                        break
-                    else:
-                        if connection_attempts < max_connection_attempts:
-                            self.logger.debug(
-                                f"Connection attempt {connection_attempts} failed, retrying in {interval}s..."
-                            )
-                            time.sleep(interval)
-                except Exception as e:
-                    if connection_attempts < max_connection_attempts:
+                # Create fresh connection for each attempt
+                client = KubernetesOpenSearchClient.from_security_config(
+                    self.config.opensearch.security, namespace, service_name
+                )
+                if not client.connect(quiet=True):
+                    remaining_time = timeout - (time.time() - start_time)
+                    if remaining_time > interval:
                         self.logger.debug(
-                            f"Connection attempt {connection_attempts} failed: {e}, retrying in {interval}s..."
+                            f"Connection failed, retrying in {interval}s..."
                         )
                         time.sleep(interval)
+                        continue
                     else:
-                        raise
+                        return ActionResult(
+                            False, "Failed to connect to OpenSearch cluster"
+                        )
 
-            if (
-                not client
-                or not hasattr(client, "port_forward_process")
-                or not client.port_forward_process
-            ):
-                return ActionResult(
-                    False,
-                    f"Failed to establish connection after {max_connection_attempts} attempts",
-                )
+                health = client.health()
+                current_status = health.get("status", "red")
+                last_status = current_status
 
-            # Now test cluster health with established connection
-            while time.time() - start_time < timeout:
-                try:
-                    health = client.health()
-
-                    # Check if cluster status meets expectation
-                    current_status = health.get("status", "red")
-                    if not self._health_status_reached(current_status, expected_status):
-                        remaining_time = timeout - (time.time() - start_time)
-                        if remaining_time > interval:
-                            self.logger.info(
-                                f"Cluster health is {current_status}, waiting for {expected_status} ({remaining_time:.0f}s remaining)"
-                            )
-                            time.sleep(interval)
-                            continue
-                        else:
-                            return ActionResult(
-                                False,
-                                f"Cluster did not reach {expected_status} status within {timeout_str} (final status: {current_status})",
-                            )
-
-                    # Get cluster stats for validation
-                    cluster_stats = client.cluster_stats()
-
-                    # Validate node count if requested
-                    if check_nodes:
-                        active_nodes = health.get("number_of_nodes", 0)
-                        if active_nodes == 0:
-                            return ActionResult(False, "No active nodes found")
-
-                    # Validate indices if requested
-                    if check_indices:
-                        relocating_shards = health.get("relocating_shards", 0)
-                        unassigned_shards = health.get("unassigned_shards", 0)
-                        if expected_status == "green" and (
-                            relocating_shards > 0 or unassigned_shards > 0
-                        ):
-                            return ActionResult(
-                                False,
-                                f"Cluster has {relocating_shards} relocating and {unassigned_shards} unassigned shards",
-                            )
-
-                    return ActionResult(
-                        True,
-                        f"Cluster health is {health['status']} with {health['number_of_nodes']} nodes",
-                    )
-
-                except Exception as e:
+                if not self._health_status_reached(current_status, expected_status):
                     remaining_time = timeout - (time.time() - start_time)
                     if remaining_time > interval:
                         self.logger.info(
-                            f"Health check failed: {e}, retrying in {interval}s..."
+                            f"Cluster health is {current_status}, waiting for {expected_status} ({remaining_time:.0f}s remaining)"
                         )
+                        client.disconnect()
+                        client = None
                         time.sleep(interval)
+                        continue
                     else:
-                        return ActionResult(False, f"Health validation failed: {e}")
+                        return ActionResult(
+                            False,
+                            f"Cluster did not reach {expected_status} status within {timeout_str} (final status: {current_status})",
+                        )
 
-            return ActionResult(
-                False, f"Failed to validate cluster health: Timeout after {timeout_str}"
-            )
+                # Validate node count if requested
+                if check_nodes:
+                    active_nodes = health.get("number_of_nodes", 0)
+                    if active_nodes == 0:
+                        return ActionResult(False, "No active nodes found")
 
-        finally:
-            if client:
-                client.disconnect()
+                # Validate indices if requested
+                if check_indices:
+                    relocating_shards = health.get("relocating_shards", 0)
+                    unassigned_shards = health.get("unassigned_shards", 0)
+                    if expected_status == "green" and (
+                        relocating_shards > 0 or unassigned_shards > 0
+                    ):
+                        return ActionResult(
+                            False,
+                            f"Cluster has {relocating_shards} relocating and {unassigned_shards} unassigned shards",
+                        )
+
+                return ActionResult(
+                    True,
+                    f"Cluster health is {health['status']} with {health['number_of_nodes']} nodes",
+                )
+
+            except Exception as e:
+                remaining_time = timeout - (time.time() - start_time)
+                if remaining_time > interval:
+                    self.logger.info(
+                        f"Health check failed: {e}, retrying in {interval}s..."
+                    )
+                    time.sleep(interval)
+                else:
+                    return ActionResult(False, f"Health validation failed: {e}")
+
+            finally:
+                if client:
+                    try:
+                        client.disconnect()
+                    except Exception:
+                        pass
+                    client = None
+
+        return ActionResult(
+            False,
+            f"Cluster did not reach {expected_status} status within {timeout_str} (final status: {last_status})",
+        )
 
     def _parse_duration(self, duration_str: str) -> int:
         """Parse duration string to seconds."""
@@ -176,104 +163,124 @@ class ValidateDataIntegrityAction(BaseAction):
 
         self.logger.info("Validating data integrity")
 
-        try:
-            client = KubernetesOpenSearchClient.from_security_config(
-                self.config.opensearch.security, namespace, service_name
-            )
-            with client:
-                # Count documents across indices
-                total_docs = 0
-                for index_pattern in indices:
-                    try:
-                        count = client.count(index_pattern)
-                        total_docs += count
-                        self.logger.debug(
-                            f"Index pattern '{index_pattern}': {count} documents"
-                        )
-                    except Exception as e:
-                        self.logger.warning(
-                            f"Could not count documents in '{index_pattern}': {e}"
-                        )
+        # Retry logic for transient connection failures
+        max_retries = 5
+        retry_delay = 10
 
-                # Validate document count
-                if expected_documents is not None:
-                    if total_docs != expected_documents:
-                        return ActionResult(
-                            False,
-                            f"Expected {expected_documents} documents, found {total_docs}",
-                        )
-
-                # Run sample queries
-                for i, query_config in enumerate(sample_queries):
-                    query = query_config.get("query")
-                    expected_hits = query_config.get("expected_hits")
-                    min_hits = query_config.get("min_hits")
-
-                    if isinstance(query, str):
-                        query = json.loads(query)
-
-                    # Use first index pattern for queries
-                    index_pattern = indices[0] if indices else "*"
-                    self.logger.debug(
-                        f"Running sample query {i + 1}: {query} on index pattern '{index_pattern}'"
-                    )
-
-                    # Show index mapping for debugging
-                    try:
-                        mapping = client.get_index_mapping(index_pattern)
-                        if mapping:
-                            self.logger.debug(
-                                f"Index mapping for '{index_pattern}': {mapping}"
-                            )
-                    except Exception as e:
-                        self.logger.warning(f"Could not retrieve index mapping: {e}")
-
-                    # First refresh the index to ensure latest data is available
-                    try:
-                        client.refresh_index(index_pattern)
-                    except Exception as e:
-                        self.logger.warning(
-                            f"Could not refresh index {index_pattern}: {e}"
-                        )
-
-                    result = client.search(index_pattern, query, size=0)
-                    hits = result["hits"]["total"]["value"]
-                    self.logger.info(f"Sample query {i + 1} returned {hits} hits")
-
-                    if expected_hits is not None and hits != expected_hits:
-                        return ActionResult(
-                            False, f"Query expected {expected_hits} hits, got {hits}"
-                        )
-
-                    if min_hits is not None and hits < min_hits:
-                        # Log a sample of documents to understand the data
+        for attempt in range(max_retries):
+            client = None
+            try:
+                client = KubernetesOpenSearchClient.from_security_config(
+                    self.config.opensearch.security, namespace, service_name
+                )
+                with client:
+                    # Count documents across indices
+                    total_docs = 0
+                    for index_pattern in indices:
                         try:
-                            sample_result = client.search(
-                                index_pattern, {"match_all": {}}, size=5
-                            )
-                            sample_docs = [
-                                doc["_source"]
-                                for doc in sample_result.get("hits", {}).get("hits", [])
-                            ]
+                            count = client.count(index_pattern)
+                            total_docs += count
                             self.logger.debug(
-                                f"Sample documents from index: {sample_docs}"
+                                f"Index pattern '{index_pattern}': {count} documents"
                             )
                         except Exception as e:
                             self.logger.warning(
-                                f"Could not retrieve sample documents: {e}"
+                                f"Could not count documents in '{index_pattern}': {e}"
                             )
 
-                        return ActionResult(
-                            False,
-                            f"Query expected at least {min_hits} hits, got {hits}",
+                    # Validate document count
+                    if expected_documents is not None:
+                        if total_docs != expected_documents:
+                            return ActionResult(
+                                False,
+                                f"Expected {expected_documents} documents, found {total_docs}",
+                            )
+
+                    # Run sample queries
+                    for i, query_config in enumerate(sample_queries):
+                        query = query_config.get("query")
+                        expected_hits = query_config.get("expected_hits")
+                        min_hits = query_config.get("min_hits")
+
+                        if isinstance(query, str):
+                            query = json.loads(query)
+
+                        # Use first index pattern for queries
+                        index_pattern = indices[0] if indices else "*"
+                        self.logger.debug(
+                            f"Running sample query {i + 1}: {query} on index pattern '{index_pattern}'"
                         )
 
-                return ActionResult(
-                    True, f"Data integrity validated: {total_docs} total documents"
-                )
+                        # Show index mapping for debugging
+                        try:
+                            mapping = client.get_index_mapping(index_pattern)
+                            if mapping:
+                                self.logger.debug(
+                                    f"Index mapping for '{index_pattern}': {mapping}"
+                                )
+                        except Exception as e:
+                            self.logger.warning(
+                                f"Could not retrieve index mapping: {e}"
+                            )
 
-        except Exception as e:
-            return ActionResult(False, f"Failed to validate data integrity: {e}")
+                        # First refresh the index to ensure latest data is available
+                        try:
+                            client.refresh_index(index_pattern)
+                        except Exception as e:
+                            self.logger.warning(
+                                f"Could not refresh index {index_pattern}: {e}"
+                            )
+
+                        result = client.search(index_pattern, query, size=0)
+                        hits = result["hits"]["total"]["value"]
+                        self.logger.info(f"Sample query {i + 1} returned {hits} hits")
+
+                        if expected_hits is not None and hits != expected_hits:
+                            return ActionResult(
+                                False,
+                                f"Query expected {expected_hits} hits, got {hits}",
+                            )
+
+                        if min_hits is not None and hits < min_hits:
+                            # Log a sample of documents to understand the data
+                            try:
+                                sample_result = client.search(
+                                    index_pattern, {"match_all": {}}, size=5
+                                )
+                                sample_docs = [
+                                    doc["_source"]
+                                    for doc in sample_result.get("hits", {}).get(
+                                        "hits", []
+                                    )
+                                ]
+                                self.logger.debug(
+                                    f"Sample documents from index: {sample_docs}"
+                                )
+                            except Exception as e:
+                                self.logger.warning(
+                                    f"Could not retrieve sample documents: {e}"
+                                )
+
+                            return ActionResult(
+                                False,
+                                f"Query expected at least {min_hits} hits, got {hits}",
+                            )
+
+                    return ActionResult(
+                        True, f"Data integrity validated: {total_docs} total documents"
+                    )
+
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    self.logger.warning(
+                        f"Data integrity check attempt {attempt + 1} failed: {e}, retrying in {retry_delay}s..."
+                    )
+                    time.sleep(retry_delay)
+                else:
+                    return ActionResult(
+                        False,
+                        f"Failed to validate data integrity after {max_retries} attempts: {e}",
+                    )
 
 
 class WaitForClusterReadyAction(BaseAction):
@@ -690,12 +697,14 @@ class ValidateNodeConfigurationAction(BaseAction):
                 return ActionResult(False, "Failed to load Kubernetes config")
 
             # Get pods based on node group
+            # Use opster.io labels which are what the opensearch-operator actually sets
+            cluster_name = params.get(
+                "cluster_name", self.config.opensearch.cluster_name
+            )
             if node_group == "all":
-                label_selector = (
-                    "app.kubernetes.io/component in (opensearch-cluster,opensearch)"
-                )
+                label_selector = f"opster.io/opensearch-cluster={cluster_name}"
             else:
-                label_selector = f"opensearch.opster.io/role={node_group}"
+                label_selector = f"opster.io/opensearch-cluster={cluster_name},opensearch.role={node_group}"
 
             pods = k8s_manager.get_pods(namespace, label_selector=label_selector)
 
@@ -788,13 +797,13 @@ class ValidateNodeConfigurationAction(BaseAction):
     ) -> Dict[str, Any]:
         """Validate vm.max_map_count setting."""
         try:
-            cmd = ["sysctl", "vm.max_map_count"]
+            # Read from /proc instead of sysctl (sysctl may not be available in minimal containers)
+            cmd = ["cat", "/proc/sys/vm/max_map_count"]
             result = k8s_manager.exec_in_pod(namespace, pod_name, cmd)
 
             if result["success"]:
                 output = result["output"].strip()
-                # Parse output like "vm.max_map_count = 262144"
-                current_value = int(output.split("=")[-1].strip())
+                current_value = int(output)
 
                 if current_value >= expected_min:
                     return {
@@ -839,12 +848,13 @@ class ValidateNodeConfigurationAction(BaseAction):
     ) -> Dict[str, Any]:
         """Validate vm.swappiness setting."""
         try:
-            cmd = ["sysctl", "vm.swappiness"]
+            # Read from /proc instead of sysctl (sysctl may not be available in minimal containers)
+            cmd = ["cat", "/proc/sys/vm/swappiness"]
             result = k8s_manager.exec_in_pod(namespace, pod_name, cmd)
 
             if result["success"]:
                 output = result["output"].strip()
-                current_value = int(output.split("=")[-1].strip())
+                current_value = int(output)
 
                 if current_value <= expected_max:
                     return {
@@ -889,12 +899,13 @@ class ValidateNodeConfigurationAction(BaseAction):
     ) -> Dict[str, Any]:
         """Validate fs.file-max setting."""
         try:
-            cmd = ["sysctl", "fs.file-max"]
+            # Read from /proc instead of sysctl (sysctl may not be available in minimal containers)
+            cmd = ["cat", "/proc/sys/fs/file-max"]
             result = k8s_manager.exec_in_pod(namespace, pod_name, cmd)
 
             if result["success"]:
                 output = result["output"].strip()
-                current_value = int(output.split("=")[-1].strip())
+                current_value = int(output)
 
                 if current_value >= expected_min:
                     return {

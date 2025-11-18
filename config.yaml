@@ -21,7 +21,7 @@ opensearch:
   operator_version: "latest"
   # opensearch_version: "2.11.0"  # Commented out to use "latest" tag by default
   # Local operator development (leave empty to use upstream releases)
-  local_operator_path: "/Users/itamarsyn-hershko/code/opensearch-k8s-operator/opensearch-operator"  # Path to local operator source code
+  local_operator_path: "../opensearch-k8s-operator/opensearch-operator"  # Path to local operator source code
 
   # Default resource configuration for OpenSearch nodes
   node_resources:

@@ -44,7 +44,6 @@ class UpgradeClusterAction(BaseAction):
                     cluster_name,
                     namespace,
                     target_version,
-                    max_unavailable,
                     validation_steps,
                     rollback_on_failure,
                     timeout_str,
@@ -86,7 +85,6 @@ class UpgradeClusterAction(BaseAction):
         cluster_name: str,
         namespace: str,
         target_version: str,
-        max_unavailable: int,
         validation_steps: List[str],
         rollback_on_failure: bool,
         timeout_str: str,
@@ -132,7 +130,7 @@ class UpgradeClusterAction(BaseAction):
 
             # Run validation steps
             for step in validation_steps:
-                if not self._run_validation_step(step, namespace):
+                if not self._run_validation_step(step, namespace, cluster_name):
                     return ActionResult(False, f"Validation step '{step}' failed")
 
             return ActionResult(
@@ -250,7 +248,6 @@ class UpgradeClusterAction(BaseAction):
 
                 parts = line.split(";")
                 if len(parts) >= 5:
-                    pod_name = parts[0]
                     image = parts[1]
                     phase = parts[2]
                     ready = parts[3] == "true"
@@ -286,7 +283,9 @@ class UpgradeClusterAction(BaseAction):
             self.logger.warning(f"Failed to get node version distribution: {e}")
             return {}
 
-    def _run_validation_step(self, step: str, namespace: str) -> bool:
+    def _run_validation_step(
+        self, step: str, namespace: str, cluster_name: str
+    ) -> bool:
         """Run a validation step with retry logic."""
         if step == "check_cluster_health":
             max_retries = 5
@@ -298,15 +297,14 @@ class UpgradeClusterAction(BaseAction):
                         f"Attempting to validate cluster health (attempt {attempt + 1}/{max_retries})"
                     )
 
-                    # Try to establish connection with retry
-                    client = KubernetesOpenSearchClient(
-                        namespace=namespace, service_name=cluster_name
+                    # Try to establish connection with retry using security config
+                    client = KubernetesOpenSearchClient.from_security_config(
+                        self.config.opensearch.security, namespace, cluster_name
                     )
                     if client.connect(quiet=True):
                         try:
                             # Wait for cluster to be healthy
                             result = client.wait_for_cluster_health("yellow", 60)
-                            client.disconnect()
                             if result:
                                 self.logger.info("Cluster health validation successful")
                                 return True

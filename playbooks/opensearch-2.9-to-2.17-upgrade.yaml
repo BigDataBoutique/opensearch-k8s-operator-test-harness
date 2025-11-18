@@ -116,6 +116,9 @@ phases:
             - "validate_data_integrity"
           rollback_on_failure: true
           timeout: "15m"  # Minor upgrades should be faster than major upgrades
+      - action: update_cluster_allocation_settings
+        params:
+          allocation_enable: "all"
       - action: wait_for_cluster_ready
         params:
           timeout: "5m"
@@ -127,10 +130,13 @@ phases:
   - name: "post_upgrade_validation"
     description: "Validate cluster after upgrade to 2.17"
     steps:
+      - action: update_cluster_allocation_settings
+        params:
+          allocation_enable: "all"
       - action: validate_cluster_health
         params:
           expected_status: "green"
-          timeout: "5m"
+          timeout: "10m"
           check_nodes: true
           check_indices: true
       - action: validate_data_integrity
@@ -152,6 +158,9 @@ phases:
   - name: "new_data_in_2.17"
     description: "Create new data in OpenSearch 2.17"
     steps:
+      - action: update_cluster_allocation_settings
+        params:
+          allocation_enable: "all"
       - action: index_documents
         params:
           count: 1500
@@ -188,6 +197,9 @@ phases:
   - name: "cluster_health_final"
     description: "Final cluster health and configuration validation"
     steps:
+      - action: update_cluster_allocation_settings
+        params:
+          allocation_enable: "all"
       - action: validate_cluster_health
         params:
           expected_status: "green"
