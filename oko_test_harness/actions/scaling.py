@@ -80,27 +80,6 @@ class ScaleClusterAction(BaseAction):
         except Exception as e:
             return ActionResult(False, f"Failed to scale cluster: {e}")
 
-    def _build_scale_patch(self, node_type: str, target_count: int) -> Dict[str, Any]:
-        """Build patch data for scaling operation."""
-        # This would depend on the specific OpenSearch operator CRD structure
-        # Here's a simplified example
-        if node_type == "data":
-            return {
-                "spec": {"nodePools": [{"component": "data", "replicas": target_count}]}
-            }
-        elif node_type == "master":
-            return {
-                "spec": {
-                    "nodePools": [{"component": "masters", "replicas": target_count}]
-                }
-            }
-        else:
-            return {
-                "spec": {
-                    "nodePools": [{"component": node_type, "replicas": target_count}]
-                }
-            }
-
     def _wait_for_scaling_completion(
         self, namespace: str, node_type: str, target_count: int, timeout: int
     ) -> bool:
@@ -146,17 +125,6 @@ class ScaleClusterAction(BaseAction):
                 time.sleep(30)
 
         return False
-
-    def _parse_duration(self, duration_str: str) -> int:
-        """Parse duration string to seconds."""
-        if duration_str.endswith("s"):
-            return int(duration_str[:-1])
-        elif duration_str.endswith("m"):
-            return int(duration_str[:-1]) * 60
-        elif duration_str.endswith("h"):
-            return int(duration_str[:-1]) * 3600
-        else:
-            return int(duration_str)
 
 
 class ScaleDownClusterAction(BaseAction):
@@ -289,33 +257,3 @@ class ScaleDownClusterAction(BaseAction):
             time.sleep(30)
 
         return False
-
-    def _build_scale_patch(self, node_type: str, target_count: int) -> Dict[str, Any]:
-        """Build patch data for scaling operation."""
-        if node_type == "data":
-            return {
-                "spec": {"nodePools": [{"component": "data", "replicas": target_count}]}
-            }
-        elif node_type == "master":
-            return {
-                "spec": {
-                    "nodePools": [{"component": "masters", "replicas": target_count}]
-                }
-            }
-        else:
-            return {
-                "spec": {
-                    "nodePools": [{"component": node_type, "replicas": target_count}]
-                }
-            }
-
-    def _parse_duration(self, duration_str: str) -> int:
-        """Parse duration string to seconds."""
-        if duration_str.endswith("s"):
-            return int(duration_str[:-1])
-        elif duration_str.endswith("m"):
-            return int(duration_str[:-1]) * 60
-        elif duration_str.endswith("h"):
-            return int(duration_str[:-1]) * 3600
-        else:
-            return int(duration_str)

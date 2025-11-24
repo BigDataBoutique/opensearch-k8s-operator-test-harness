@@ -129,17 +129,6 @@ class ValidateClusterHealthAction(BaseAction):
             f"Cluster did not reach {expected_status} status within {timeout_str} (final status: {last_status})",
         )
 
-    def _parse_duration(self, duration_str: str) -> int:
-        """Parse duration string to seconds."""
-        if duration_str.endswith("s"):
-            return int(duration_str[:-1])
-        elif duration_str.endswith("m"):
-            return int(duration_str[:-1]) * 60
-        elif duration_str.endswith("h"):
-            return int(duration_str[:-1]) * 3600
-        else:
-            return int(duration_str)
-
     def _health_status_reached(self, current: str, target: str) -> bool:
         """Check if current health status meets or exceeds target."""
         status_order = {"red": 0, "yellow": 1, "green": 2}
@@ -424,17 +413,6 @@ class WaitForClusterReadyAction(BaseAction):
 
         except Exception as e:
             return ActionResult(False, f"Error waiting for cluster readiness: {e}")
-
-    def _parse_duration(self, duration_str: str) -> int:
-        """Parse duration string to seconds."""
-        if duration_str.endswith("s"):
-            return int(duration_str[:-1])
-        elif duration_str.endswith("m"):
-            return int(duration_str[:-1]) * 60
-        elif duration_str.endswith("h"):
-            return int(duration_str[:-1]) * 3600
-        else:
-            return int(duration_str)
 
     def _health_status_reached(self, current: str, target: str) -> bool:
         """Check if current health status meets or exceeds target."""
@@ -1547,17 +1525,6 @@ class ValidateClusterConfigurationAction(BaseAction):
 
         except Exception as e:
             return ActionResult(False, f"Failed to validate cluster configuration: {e}")
-
-    def _parse_duration(self, duration_str: str) -> int:
-        """Parse duration string to seconds."""
-        if duration_str.endswith("s"):
-            return int(duration_str[:-1])
-        elif duration_str.endswith("m"):
-            return int(duration_str[:-1]) * 60
-        elif duration_str.endswith("h"):
-            return int(duration_str[:-1]) * 3600
-        else:
-            return int(duration_str)
 
     def _validate_cluster_settings(
         self, client: KubernetesOpenSearchClient, cluster_settings: Dict[str, Any]

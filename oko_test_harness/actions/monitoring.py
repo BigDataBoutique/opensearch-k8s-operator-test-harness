@@ -283,17 +283,6 @@ class CaptureMetricsAction(BaseAction):
         except Exception as e:
             return ActionResult(False, f"Failed to capture metrics: {e}")
 
-    def _parse_duration(self, duration_str: str) -> int:
-        """Parse duration string to seconds."""
-        if duration_str.endswith("s"):
-            return int(duration_str[:-1])
-        elif duration_str.endswith("m"):
-            return int(duration_str[:-1]) * 60
-        elif duration_str.endswith("h"):
-            return int(duration_str[:-1]) * 3600
-        else:
-            return int(duration_str)
-
 
 class DebugPauseAction(BaseAction):
     """Action to pause execution for manual inspection."""
@@ -342,14 +331,3 @@ class DebugPauseAction(BaseAction):
             self.logger.warning(f"Debug pause error: {e}")
             time.sleep(timeout)
             return ActionResult(True, "Debug pause completed (fallback)")
-
-    def _parse_duration(self, duration_str: str) -> int:
-        """Parse duration string to seconds."""
-        if duration_str.endswith("s"):
-            return int(duration_str[:-1])
-        elif duration_str.endswith("m"):
-            return int(duration_str[:-1]) * 60
-        elif duration_str.endswith("h"):
-            return int(duration_str[:-1]) * 3600
-        else:
-            return int(duration_str)
