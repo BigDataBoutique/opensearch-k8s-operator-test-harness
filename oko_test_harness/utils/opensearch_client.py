@@ -449,7 +449,7 @@ class KubernetesOpenSearchClient(OpenSearchClient):
 
             # Test connection
             try:
-                health = self.health()
+                self.health()
                 logger.debug(
                     f"Connected to OpenSearch cluster via port-forward (port {self.local_port})"
                 )

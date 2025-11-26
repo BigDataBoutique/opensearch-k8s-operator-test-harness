@@ -145,7 +145,6 @@ class ValidateDataIntegrityAction(BaseAction):
 
         indices = params.get("indices", ["*"])
         expected_documents = params.get("expected_documents")
-        checksum_validation = params.get("checksum_validation", False)
         sample_queries = params.get("sample_queries", [])
         namespace = params.get("namespace", self.config.opensearch.operator_namespace)
         service_name = params.get("service_name", self.config.opensearch.service_name)
@@ -1202,12 +1201,6 @@ class ValidateNodeConfigurationAction(BaseAction):
                             f"JVM maximum heap size exceeds maximum {max_heap}"
                         )
 
-                # Check heap ratio to container memory
-                if "heap_to_container_ratio" in jvm_checks:
-                    expected_ratio = jvm_checks["heap_to_container_ratio"]
-                    # This would require getting container memory limits and comparing
-                    # Implementation would be more complex, checking the ratio
-
             if validation_errors:
                 return {
                     "success": False,
@@ -1251,7 +1244,7 @@ class ValidateNodeConfigurationAction(BaseAction):
                 return bytes1 == bytes2
             else:
                 return False
-        except:
+        except Exception:
             return False
 
     def _compare_cpu_size(self, cpu1: str, cpu2: str, operator: str) -> bool:
@@ -1272,7 +1265,7 @@ class ValidateNodeConfigurationAction(BaseAction):
                 return millis1 == millis2
             else:
                 return False
-        except:
+        except Exception:
             return False
 
     def _memory_to_bytes(self, size: str) -> int:
@@ -1311,7 +1304,7 @@ class ValidateNodeConfigurationAction(BaseAction):
         # Try to parse as plain number (assumed bytes)
         try:
             return int(float(size))
-        except:
+        except Exception:
             raise ValueError(f"Cannot parse memory size: {size}")
 
     def _cpu_to_millis(self, cpu: str) -> int:
@@ -1352,7 +1345,7 @@ class ValidateNodeConfigurationAction(BaseAction):
                 return actual_bytes < expected_bytes
             else:
                 return actual_bytes == expected_bytes
-        except:
+        except Exception:
             return False
 
     def _jvm_memory_to_bytes(self, size: str) -> int:
@@ -1724,7 +1717,7 @@ class ValidateClusterConfigurationAction(BaseAction):
                         debug_info += (
                             f", but found {len(node_info['nodes'])} nodes via nodes API"
                         )
-                except:
+                except Exception:
                     debug_info = (
                         "\nNode details: Failed to get both cluster stats and node info"
                     )
@@ -1855,14 +1848,12 @@ class ValidateClusterConfigurationAction(BaseAction):
             # Check if security plugin is enabled
             security_enabled = security_settings.get("enabled", True)
             ssl_enabled = security_settings.get("ssl_enabled")
-            required_auth_methods = security_settings.get("required_auth_methods", [])
 
             # Try to access security API to check if it's enabled
             try:
                 # This would typically check /_plugins/_security/api/account
                 # For now, we'll check cluster health which should work regardless
-                health = client.health()
-                cluster_name = health.get("cluster_name", "")
+                client.health()
 
                 # If we can access without auth and security is supposed to be enabled, that's a problem
                 if security_enabled and not client.using_auth():

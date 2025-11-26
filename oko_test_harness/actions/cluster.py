@@ -1504,8 +1504,6 @@ class DeleteClusterAction(BaseAction):
         cluster_name = params.get("cluster_name", self.config.opensearch.cluster_name)
         namespace = params.get("namespace", self.config.opensearch.operator_namespace)
         force = params.get("force", False)
-        wait_for_completion = params.get("wait_for_completion", True)
-        timeout = params.get("timeout", "5m")
 
         self.logger.info(f"Deleting OpenSearch cluster: {cluster_name}")
 

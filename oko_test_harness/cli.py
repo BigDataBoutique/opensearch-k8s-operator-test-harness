@@ -263,7 +263,6 @@ def list_actions():
         click.echo(f"\n{category}:")
         for action in actions:
             if action in executor.actions:
-                action_class = executor.actions[action]
                 click.echo(f"  • {action}")
             else:
                 click.echo(f"  • {action} (not implemented)")

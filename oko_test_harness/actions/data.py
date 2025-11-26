@@ -23,8 +23,6 @@ class IndexDocumentsAction(BaseAction):
         index = self._substitute_template_vars(params.get("index", "test-index"))
         document_template = params.get("document_template")
         bulk_size = params.get("bulk_size", 100)
-        threads = params.get("threads", 1)
-        rate_limit = params.get("rate_limit")
         replicas = params.get("replicas", 0)  # Default to 0 replicas for testing
         shards = params.get("shards", 1)
         namespace = params.get("namespace", self.config.opensearch.operator_namespace)
@@ -147,7 +145,6 @@ class QueryDocumentsAction(BaseAction):
         index = params.get("index", "test-index-*")
         query = params.get("query", {"match_all": {}})
         expected_count = params.get("expected_count")
-        timeout_str = params.get("timeout", "30s")
         namespace = params.get("namespace", self.config.opensearch.operator_namespace)
         service_name = params.get("service_name", self.config.opensearch.service_name)
 

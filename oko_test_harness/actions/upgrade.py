@@ -19,7 +19,6 @@ class UpgradeClusterAction(BaseAction):
 
         target_version = params.get("target_version")
         strategy = params.get("strategy", "rolling")
-        max_unavailable = params.get("max_unavailable", 1)
         validation_steps = params.get("validation_steps", ["check_cluster_health"])
         rollback_on_failure = params.get("rollback_on_failure", True)
         timeout_str = params.get("timeout", "15m")

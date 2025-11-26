@@ -20,7 +20,6 @@ class ScaleClusterAction(BaseAction):
 
         node_type = params.get("node_type", "data")
         target_count = params.get("target_count", 5)
-        strategy = params.get("strategy", "gradual")
         wait_for_green = params.get("wait_for_green", True)
         timeout_str = params.get("timeout", "10m")
         cluster_name = params.get("cluster_name", self.config.opensearch.cluster_name)

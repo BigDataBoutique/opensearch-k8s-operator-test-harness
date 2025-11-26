@@ -124,7 +124,6 @@ class InjectNodeFailureAction(BaseAction):
         )
         count = params.get("count", 1)
         method = params.get("method", "drain")
-        recovery_timeout = params.get("recovery_timeout", "10m")
 
         self.logger.info(f"Injecting node failure: {method} {count} node(s)")
 
