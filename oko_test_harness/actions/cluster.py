@@ -1,15 +1,19 @@
 """Cluster management actions."""
 
+import json
 import subprocess
 import time
 from typing import Any, Dict, List
 
+from tenacity import RetryError
+
 from oko_test_harness.actions.base import BaseAction
 from oko_test_harness.models.playbook import ActionResult
+from oko_test_harness.retry_utils import oko_retry
 from oko_test_harness.utils.kubernetes import (
     KindClusterManager,
-    MinikubeClusterManager,
     KubernetesManager,
+    MinikubeClusterManager,
 )
 
 
@@ -1177,15 +1181,7 @@ data:
         self, cluster_name: str, namespace: str, security_config: Dict[str, Any]
     ) -> bool:
         """Fix cluster allocation settings after deployment to enable replica allocation."""
-        import time
-        import subprocess
-        import json
-
         try:
-            # Wait for cluster to be accessible
-            max_retries = 30
-            retry_delay = 10
-
             username = security_config.get("username", "admin")
             password = security_config.get("password", "Admin123!")
 
@@ -1193,49 +1189,40 @@ data:
                 "Waiting for cluster to be accessible before fixing allocation settings..."
             )
 
-            for attempt in range(max_retries):
-                try:
-                    # Check if cluster is accessible (only check for successful response, ignore health status)
-                    check_cmd = [
-                        "kubectl",
-                        "exec",
-                        f"{cluster_name}-nodes-0",
-                        "-n",
-                        namespace,
-                        "--",
-                        "curl",
-                        "-k",
-                        "-u",
-                        f"{username}:{password}",
-                        "--silent",
-                        "--fail",
-                        "--max-time",
-                        "10",
-                        "https://localhost:9200/_cluster/health",
-                    ]
+            # Wait for cluster to be accessible (30 attempts * 10s = 5 minutes)
+            @oko_retry(300, 10)
+            def _check_cluster_accessible():
+                check_cmd = [
+                    "kubectl",
+                    "exec",
+                    f"{cluster_name}-nodes-0",
+                    "-n",
+                    namespace,
+                    "--",
+                    "curl",
+                    "-k",
+                    "-u",
+                    f"{username}:{password}",
+                    "--silent",
+                    "--fail",
+                    "--max-time",
+                    "10",
+                    "https://localhost:9200/_cluster/health",
+                ]
 
-                    result = subprocess.run(
-                        check_cmd, capture_output=True, text=True, timeout=15
-                    )
+                result = subprocess.run(
+                    check_cmd, capture_output=True, text=True, timeout=15
+                )
 
-                    if result.returncode == 0:
-                        self.logger.info(
-                            f"Cluster is accessible (attempt {attempt + 1})"
-                        )
-                        break
-                    else:
-                        self.logger.debug(
-                            f"Cluster not yet accessible (attempt {attempt + 1}/{max_retries}), waiting {retry_delay}s..."
-                        )
-                        time.sleep(retry_delay)
+                if result.returncode == 0:
+                    self.logger.info("Cluster is accessible")
+                    return
 
-                except subprocess.TimeoutExpired:
-                    self.logger.debug(
-                        f"Timeout checking cluster accessibility (attempt {attempt + 1}/{max_retries})"
-                    )
-                    time.sleep(retry_delay)
+                raise Exception("Cluster not yet accessible")
 
-            else:
+            try:
+                _check_cluster_accessible()
+            except RetryError:
                 self.logger.error(
                     "Cluster did not become accessible within timeout period"
                 )

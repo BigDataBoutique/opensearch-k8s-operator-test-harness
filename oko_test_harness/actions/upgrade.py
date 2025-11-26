@@ -1,11 +1,13 @@
 """Upgrade actions."""
 
 import subprocess
-import time
 from typing import Any, Dict, List
+
+from tenacity import RetryError
 
 from oko_test_harness.actions.base import BaseAction
 from oko_test_harness.models.playbook import ActionResult
+from oko_test_harness.retry_utils import oko_retry
 from oko_test_harness.utils.opensearch_client import KubernetesOpenSearchClient
 
 
@@ -152,65 +154,57 @@ class UpgradeClusterAction(BaseAction):
     ) -> bool:
         """Wait for upgrade to complete."""
         timeout = self._parse_duration(timeout_str)
-        start_time = time.time()
 
         self.logger.info(f"Waiting for upgrade to complete (timeout: {timeout_str})")
 
-        while time.time() - start_time < timeout:
-            try:
-                elapsed = int(time.time() - start_time)
-
-                # Get node version distribution
-                node_versions = self._get_node_version_distribution(
-                    cluster_name, namespace
+        @oko_retry(timeout, 30)
+        def _check_upgrade_complete():
+            # Get node version distribution
+            node_versions = self._get_node_version_distribution(cluster_name, namespace)
+            if node_versions:
+                version_summary = ", ".join(
+                    [
+                        f"{version}: {count} nodes"
+                        for version, count in node_versions.items()
+                    ]
                 )
-                if node_versions:
-                    version_summary = ", ".join(
+                self.logger.info(f"Upgrade progress: {version_summary}")
+
+                # Check if all nodes are on target version
+                if len(node_versions) == 1 and target_version in node_versions:
+                    # Check cluster phase to ensure it's running
+                    phase_result = subprocess.run(
                         [
-                            f"{version}: {count} nodes"
-                            for version, count in node_versions.items()
-                        ]
-                    )
-                    self.logger.info(
-                        f"Upgrade progress ({elapsed}s): {version_summary}"
-                    )
-
-                    # Check if all nodes are on target version
-                    if len(node_versions) == 1 and target_version in node_versions:
-                        # Check cluster phase to ensure it's running
-                        phase_result = subprocess.run(
-                            [
-                                "kubectl",
-                                "get",
-                                "opensearchcluster",
-                                cluster_name,
-                                "-n",
-                                namespace,
-                                "-o",
-                                "jsonpath={.status.phase}",
-                            ],
-                            capture_output=True,
-                            text=True,
-                        )
-
-                        if (
-                            phase_result.returncode == 0
-                            and phase_result.stdout.strip() == "RUNNING"
-                        ):
-                            self.logger.info("Upgrade completed successfully")
-                            return True
-                else:
-                    self.logger.info(
-                        f"Checking upgrade progress ({elapsed}s elapsed) - unable to get node versions"
+                            "kubectl",
+                            "get",
+                            "opensearchcluster",
+                            cluster_name,
+                            "-n",
+                            namespace,
+                            "-o",
+                            "jsonpath={.status.phase}",
+                        ],
+                        capture_output=True,
+                        text=True,
                     )
 
-                time.sleep(30)
-            except Exception as e:
-                self.logger.warning(f"Error checking upgrade progress: {e}")
-                time.sleep(30)
+                    if (
+                        phase_result.returncode == 0
+                        and phase_result.stdout.strip() == "RUNNING"
+                    ):
+                        self.logger.info("Upgrade completed successfully")
+                        return
 
-        self.logger.warning(f"Upgrade timeout reached after {timeout}s")
-        return False
+            raise Exception(
+                f"Waiting for all nodes to reach version {target_version} and cluster to be RUNNING"
+            )
+
+        try:
+            _check_upgrade_complete()
+            return True
+        except RetryError:
+            self.logger.warning(f"Upgrade timeout reached after {timeout}s")
+            return False
 
     def _get_node_version_distribution(
         self, cluster_name: str, namespace: str
@@ -287,46 +281,34 @@ class UpgradeClusterAction(BaseAction):
     ) -> bool:
         """Run a validation step with retry logic."""
         if step == "check_cluster_health":
-            max_retries = 5
-            retry_delay = 10
+            # 5 attempts * 10s = 50s
+            @oko_retry(50, 10)
+            def _validate_health():
+                self.logger.info("Attempting to validate cluster health")
 
-            for attempt in range(max_retries):
+                # Establish connection with security config, reconnecting on each attempt
+                client = KubernetesOpenSearchClient.from_security_config(
+                    self.config.opensearch.security, namespace, cluster_name
+                )
+                if not client.connect(quiet=True):
+                    raise Exception("Failed to connect to cluster")
+
                 try:
-                    self.logger.info(
-                        f"Attempting to validate cluster health (attempt {attempt + 1}/{max_retries})"
-                    )
+                    # Wait for cluster to be healthy
+                    result = client.wait_for_cluster_health("yellow", 60)
+                    if result:
+                        self.logger.info("Cluster health validation successful")
+                        return
+                    raise Exception("Cluster did not reach yellow status")
+                finally:
+                    client.disconnect()
 
-                    # Try to establish connection with retry using security config
-                    client = KubernetesOpenSearchClient.from_security_config(
-                        self.config.opensearch.security, namespace, cluster_name
-                    )
-                    if client.connect(quiet=True):
-                        try:
-                            # Wait for cluster to be healthy
-                            result = client.wait_for_cluster_health("yellow", 60)
-                            if result:
-                                self.logger.info("Cluster health validation successful")
-                                return True
-                        except Exception as e:
-                            self.logger.warning(f"Health check failed: {e}")
-                        finally:
-                            client.disconnect()
-                    else:
-                        self.logger.warning(
-                            f"Failed to connect to cluster on attempt {attempt + 1}"
-                        )
-
-                    if attempt < max_retries - 1:
-                        self.logger.info(f"Retrying in {retry_delay} seconds...")
-                        time.sleep(retry_delay)
-
-                except Exception as e:
-                    self.logger.warning(f"Validation attempt {attempt + 1} failed: {e}")
-                    if attempt < max_retries - 1:
-                        time.sleep(retry_delay)
-
-            self.logger.error("All cluster health validation attempts failed")
-            return False
+            try:
+                _validate_health()
+                return True
+            except RetryError:
+                self.logger.error("All cluster health validation attempts failed")
+                return False
 
         elif step == "validate_data_integrity":
             # This would run data integrity checks

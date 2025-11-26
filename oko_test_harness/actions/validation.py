@@ -1,13 +1,16 @@
 """Validation and monitoring actions."""
 
-import time
 import json
+import time
 from typing import Any, Dict, List
+
+from tenacity import RetryError
 
 from oko_test_harness.actions.base import BaseAction
 from oko_test_harness.models.playbook import ActionResult
-from oko_test_harness.utils.opensearch_client import KubernetesOpenSearchClient
+from oko_test_harness.retry_utils import StopRetryingException, oko_retry
 from oko_test_harness.utils.kubernetes import KubernetesManager
+from oko_test_harness.utils.opensearch_client import KubernetesOpenSearchClient
 
 
 class ValidateClusterHealthAction(BaseAction):
@@ -31,63 +34,38 @@ class ValidateClusterHealthAction(BaseAction):
 
         self.logger.info(f"Validating cluster health (expecting {expected_status})")
 
-        start_time = time.time()
-        client = None
         last_status = None
 
-        # Reconnect on each attempt - handles pod restarts during rolling upgrades
-        while time.time() - start_time < timeout:
-            try:
-                # Disconnect previous client if exists
-                if client:
-                    try:
-                        client.disconnect()
-                    except Exception:
-                        pass
-                    client = None
+        @oko_retry(timeout, interval)
+        def _validate_health():
+            nonlocal last_status
+            client = None
 
-                # Create fresh connection for each attempt
+            try:
+                # Create fresh connection for each attempt - handles pod restarts during rolling upgrades
                 client = KubernetesOpenSearchClient.from_security_config(
                     self.config.opensearch.security, namespace, service_name
                 )
                 if not client.connect(quiet=True):
-                    remaining_time = timeout - (time.time() - start_time)
-                    if remaining_time > interval:
-                        self.logger.debug(
-                            f"Connection failed, retrying in {interval}s..."
-                        )
-                        time.sleep(interval)
-                        continue
-                    else:
-                        return ActionResult(
-                            False, "Failed to connect to OpenSearch cluster"
-                        )
+                    raise Exception("Failed to connect to OpenSearch cluster")
 
                 health = client.health()
                 current_status = health.get("status", "red")
                 last_status = current_status
 
                 if not self._health_status_reached(current_status, expected_status):
-                    remaining_time = timeout - (time.time() - start_time)
-                    if remaining_time > interval:
-                        self.logger.info(
-                            f"Cluster health is {current_status}, waiting for {expected_status} ({remaining_time:.0f}s remaining)"
-                        )
-                        client.disconnect()
-                        client = None
-                        time.sleep(interval)
-                        continue
-                    else:
-                        return ActionResult(
-                            False,
-                            f"Cluster did not reach {expected_status} status within {timeout_str} (final status: {current_status})",
-                        )
+                    self.logger.info(
+                        f"Cluster health is {current_status}, waiting for {expected_status}"
+                    )
+                    raise Exception(
+                        f"Cluster status is {current_status}, not yet {expected_status}"
+                    )
 
                 # Validate node count if requested
                 if check_nodes:
                     active_nodes = health.get("number_of_nodes", 0)
                     if active_nodes == 0:
-                        return ActionResult(False, "No active nodes found")
+                        raise Exception("No active nodes found")
 
                 # Validate indices if requested
                 if check_indices:
@@ -96,9 +74,8 @@ class ValidateClusterHealthAction(BaseAction):
                     if expected_status == "green" and (
                         relocating_shards > 0 or unassigned_shards > 0
                     ):
-                        return ActionResult(
-                            False,
-                            f"Cluster has {relocating_shards} relocating and {unassigned_shards} unassigned shards",
+                        raise Exception(
+                            f"Cluster has {relocating_shards} relocating and {unassigned_shards} unassigned shards"
                         )
 
                 return ActionResult(
@@ -106,28 +83,20 @@ class ValidateClusterHealthAction(BaseAction):
                     f"Cluster health is {health['status']} with {health['number_of_nodes']} nodes",
                 )
 
-            except Exception as e:
-                remaining_time = timeout - (time.time() - start_time)
-                if remaining_time > interval:
-                    self.logger.info(
-                        f"Health check failed: {e}, retrying in {interval}s..."
-                    )
-                    time.sleep(interval)
-                else:
-                    return ActionResult(False, f"Health validation failed: {e}")
-
             finally:
                 if client:
                     try:
                         client.disconnect()
                     except Exception:
                         pass
-                    client = None
 
-        return ActionResult(
-            False,
-            f"Cluster did not reach {expected_status} status within {timeout_str} (final status: {last_status})",
-        )
+        try:
+            return _validate_health()
+        except RetryError:
+            return ActionResult(
+                False,
+                f"Cluster did not reach {expected_status} status within {timeout_str} (final status: {last_status})",
+            )
 
     def _health_status_reached(self, current: str, target: str) -> bool:
         """Check if current health status meets or exceeds target."""
@@ -151,124 +120,109 @@ class ValidateDataIntegrityAction(BaseAction):
 
         self.logger.info("Validating data integrity")
 
-        # Retry logic for transient connection failures
-        max_retries = 5
-        retry_delay = 10
-
-        for attempt in range(max_retries):
-            client = None
-            try:
-                client = KubernetesOpenSearchClient.from_security_config(
-                    self.config.opensearch.security, namespace, service_name
-                )
-                with client:
-                    # Count documents across indices
-                    total_docs = 0
-                    for index_pattern in indices:
-                        try:
-                            count = client.count(index_pattern)
-                            total_docs += count
-                            self.logger.debug(
-                                f"Index pattern '{index_pattern}': {count} documents"
-                            )
-                        except Exception as e:
-                            self.logger.warning(
-                                f"Could not count documents in '{index_pattern}': {e}"
-                            )
-
-                    # Validate document count
-                    if expected_documents is not None:
-                        if total_docs != expected_documents:
-                            return ActionResult(
-                                False,
-                                f"Expected {expected_documents} documents, found {total_docs}",
-                            )
-
-                    # Run sample queries
-                    for i, query_config in enumerate(sample_queries):
-                        query = query_config.get("query")
-                        expected_hits = query_config.get("expected_hits")
-                        min_hits = query_config.get("min_hits")
-
-                        if isinstance(query, str):
-                            query = json.loads(query)
-
-                        # Use first index pattern for queries
-                        index_pattern = indices[0] if indices else "*"
+        # 5 attempts * 10s = 50s
+        @oko_retry(50, 10)
+        def _validate_data():
+            client = KubernetesOpenSearchClient.from_security_config(
+                self.config.opensearch.security, namespace, service_name
+            )
+            with client:
+                # Count documents across indices
+                total_docs = 0
+                for index_pattern in indices:
+                    try:
+                        count = client.count(index_pattern)
+                        total_docs += count
                         self.logger.debug(
-                            f"Running sample query {i + 1}: {query} on index pattern '{index_pattern}'"
+                            f"Index pattern '{index_pattern}': {count} documents"
+                        )
+                    except Exception as e:
+                        self.logger.warning(
+                            f"Could not count documents in '{index_pattern}': {e}"
                         )
 
-                        # Show index mapping for debugging
+                # Validate document count
+                if expected_documents is not None:
+                    if total_docs != expected_documents:
+                        raise Exception(
+                            f"Expected {expected_documents} documents, found {total_docs}"
+                        )
+
+                # Run sample queries
+                for i, query_config in enumerate(sample_queries):
+                    query = query_config.get("query")
+                    expected_hits = query_config.get("expected_hits")
+                    min_hits = query_config.get("min_hits")
+
+                    if isinstance(query, str):
+                        query = json.loads(query)
+
+                    # Use first index pattern for queries
+                    index_pattern = indices[0] if indices else "*"
+                    self.logger.debug(
+                        f"Running sample query {i + 1}: {query} on index pattern '{index_pattern}'"
+                    )
+
+                    # Show index mapping for debugging
+                    try:
+                        mapping = client.get_index_mapping(index_pattern)
+                        if mapping:
+                            self.logger.debug(
+                                f"Index mapping for '{index_pattern}': {mapping}"
+                            )
+                    except Exception as e:
+                        self.logger.warning(f"Could not retrieve index mapping: {e}")
+
+                    # First refresh the index to ensure latest data is available
+                    try:
+                        client.refresh_index(index_pattern)
+                    except Exception as e:
+                        self.logger.warning(
+                            f"Could not refresh index {index_pattern}: {e}"
+                        )
+
+                    result = client.search(index_pattern, query, size=0)
+                    hits = result["hits"]["total"]["value"]
+                    self.logger.info(f"Sample query {i + 1} returned {hits} hits")
+
+                    if expected_hits is not None and hits != expected_hits:
+                        raise Exception(
+                            f"Query expected {expected_hits} hits, got {hits}"
+                        )
+
+                    if min_hits is not None and hits < min_hits:
+                        # Log a sample of documents to understand the data
                         try:
-                            mapping = client.get_index_mapping(index_pattern)
-                            if mapping:
-                                self.logger.debug(
-                                    f"Index mapping for '{index_pattern}': {mapping}"
-                                )
+                            sample_result = client.search(
+                                index_pattern, {"match_all": {}}, size=5
+                            )
+                            sample_docs = [
+                                doc["_source"]
+                                for doc in sample_result.get("hits", {}).get("hits", [])
+                            ]
+                            self.logger.debug(
+                                f"Sample documents from index: {sample_docs}"
+                            )
                         except Exception as e:
                             self.logger.warning(
-                                f"Could not retrieve index mapping: {e}"
+                                f"Could not retrieve sample documents: {e}"
                             )
 
-                        # First refresh the index to ensure latest data is available
-                        try:
-                            client.refresh_index(index_pattern)
-                        except Exception as e:
-                            self.logger.warning(
-                                f"Could not refresh index {index_pattern}: {e}"
-                            )
+                        raise Exception(
+                            f"Query expected at least {min_hits} hits, got {hits}"
+                        )
 
-                        result = client.search(index_pattern, query, size=0)
-                        hits = result["hits"]["total"]["value"]
-                        self.logger.info(f"Sample query {i + 1} returned {hits} hits")
+                return ActionResult(
+                    True, f"Data integrity validated: {total_docs} total documents"
+                )
 
-                        if expected_hits is not None and hits != expected_hits:
-                            return ActionResult(
-                                False,
-                                f"Query expected {expected_hits} hits, got {hits}",
-                            )
-
-                        if min_hits is not None and hits < min_hits:
-                            # Log a sample of documents to understand the data
-                            try:
-                                sample_result = client.search(
-                                    index_pattern, {"match_all": {}}, size=5
-                                )
-                                sample_docs = [
-                                    doc["_source"]
-                                    for doc in sample_result.get("hits", {}).get(
-                                        "hits", []
-                                    )
-                                ]
-                                self.logger.debug(
-                                    f"Sample documents from index: {sample_docs}"
-                                )
-                            except Exception as e:
-                                self.logger.warning(
-                                    f"Could not retrieve sample documents: {e}"
-                                )
-
-                            return ActionResult(
-                                False,
-                                f"Query expected at least {min_hits} hits, got {hits}",
-                            )
-
-                    return ActionResult(
-                        True, f"Data integrity validated: {total_docs} total documents"
-                    )
-
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    self.logger.warning(
-                        f"Data integrity check attempt {attempt + 1} failed: {e}, retrying in {retry_delay}s..."
-                    )
-                    time.sleep(retry_delay)
-                else:
-                    return ActionResult(
-                        False,
-                        f"Failed to validate data integrity after {max_retries} attempts: {e}",
-                    )
+        try:
+            return _validate_data()
+        except RetryError as e:
+            return ActionResult(
+                False,
+                f"Failed to validate data integrity after 5 attempts: {e.last_attempt.exception()}",
+            )
 
 
 class WaitForClusterReadyAction(BaseAction):
@@ -307,109 +261,95 @@ class WaitForClusterReadyAction(BaseAction):
             self.logger.info("Waiting for OpenSearch pods to initialize...")
             time.sleep(30)  # Give pods time to start
 
-            # Now test OpenSearch connectivity and conditions
-            attempt = 0
-            max_attempts = timeout // 10  # Attempt every 10 seconds
-
-            while time.time() - start_time < timeout:
-                attempt += 1
-                try:
-                    # Check for crash loops before attempting OpenSearch connection
-                    k8s_manager = KubernetesManager()
-                    if k8s_manager.load_config():
-                        crash_check = k8s_manager.check_crash_loops(
-                            namespace,
-                            label_selector="app.kubernetes.io/component=opensearch-cluster",
-                        )
-
-                        if crash_check["has_crash_loops"]:
-                            crash_details = []
-                            for cl in crash_check["crash_loops"]:
-                                details = f"{cl['pod_name']} (restarts: {cl['restart_count']})"
-                                if cl["last_error"]:
-                                    details += f" - {cl['last_error'][:100]}..."
-                                crash_details.append(details)
-
-                            return ActionResult(
-                                False,
-                                f"Detected crash loops in {len(crash_check['crash_loops'])} pods: {'; '.join(crash_details)}",
-                            )
-
-                    client = KubernetesOpenSearchClient.from_security_config(
-                        self.config.opensearch.security, namespace, service_name
+            @oko_retry(timeout, 10)
+            def _wait_for_ready():
+                # Check for crash loops before attempting OpenSearch connection
+                k8s_manager = KubernetesManager()
+                if k8s_manager.load_config():
+                    crash_check = k8s_manager.check_crash_loops(
+                        namespace,
+                        label_selector="app.kubernetes.io/component=opensearch-cluster",
                     )
-                    # Use quiet mode for all attempts except the last one
-                    is_quiet = attempt < max_attempts
 
-                    if client.connect(quiet=is_quiet):
-                        try:
-                            all_conditions_met = True
-
-                            for condition in conditions:
-                                if "cluster_health" in condition:
-                                    health = client.health()
-                                    required_status = condition["cluster_health"]
-                                    if not self._health_status_reached(
-                                        health["status"], required_status
-                                    ):
-                                        self.logger.debug(
-                                            f"Cluster health is {health['status']}, waiting for {required_status}"
-                                        )
-                                        all_conditions_met = False
-                                        break
-
-                                elif "all_nodes_ready" in condition:
-                                    if condition["all_nodes_ready"]:
-                                        # Check that all nodes are healthy
-                                        node_stats = client.node_stats()
-                                        if not node_stats.get("nodes"):
-                                            self.logger.info(
-                                                "No nodes found in cluster stats, waiting..."
-                                            )
-                                            all_conditions_met = False
-                                            break
-
-                                elif "indices_ready" in condition:
-                                    if condition["indices_ready"]:
-                                        health = client.health()
-                                        unassigned = health.get("unassigned_shards", 0)
-                                        if unassigned > 0:
-                                            self.logger.info(
-                                                f"Found {unassigned} unassigned shards, waiting..."
-                                            )
-                                            all_conditions_met = False
-                                            break
-
-                            if all_conditions_met:
-                                return ActionResult(
-                                    True,
-                                    f"All readiness conditions met for cluster '{cluster_name}'",
-                                )
-
-                        finally:
-                            client.disconnect()
-                    else:
-                        # Only log retry message if not the final attempt
-                        if is_quiet:
-                            self.logger.debug(
-                                f"Connection attempt {attempt}/{max_attempts} failed, retrying..."
+                    if crash_check["has_crash_loops"]:
+                        crash_details = []
+                        for cl in crash_check["crash_loops"]:
+                            details = (
+                                f"{cl['pod_name']} (restarts: {cl['restart_count']})"
                             )
+                            if cl["last_error"]:
+                                details += f" - {cl['last_error'][:100]}..."
+                            crash_details.append(details)
 
-                except Exception as e:
-                    # Only log retry message if not the final attempt
-                    if attempt < max_attempts:
-                        self.logger.debug(
-                            f"Connection attempt {attempt}/{max_attempts} failed, retrying..."
+                        raise StopRetryingException(
+                            f"Detected crash loops in {len(crash_check['crash_loops'])} pods: {'; '.join(crash_details)}"
                         )
-                    else:
-                        self.logger.error(f"Connection attempt failed: {e}")
 
-                time.sleep(10)
+                # Create fresh connection for each attempt
+                client = KubernetesOpenSearchClient.from_security_config(
+                    self.config.opensearch.security, namespace, service_name
+                )
 
+                if not client.connect(quiet=True):
+                    raise Exception("Failed to connect to cluster")
+
+                try:
+                    all_conditions_met = True
+
+                    for condition in conditions:
+                        if "cluster_health" in condition:
+                            health = client.health()
+                            required_status = condition["cluster_health"]
+                            if not self._health_status_reached(
+                                health["status"], required_status
+                            ):
+                                self.logger.debug(
+                                    f"Cluster health is {health['status']}, waiting for {required_status}"
+                                )
+                                all_conditions_met = False
+                                break
+
+                        elif "all_nodes_ready" in condition:
+                            if condition["all_nodes_ready"]:
+                                # Check that all nodes are healthy
+                                node_stats = client.node_stats()
+                                if not node_stats.get("nodes"):
+                                    self.logger.info(
+                                        "No nodes found in cluster stats, waiting..."
+                                    )
+                                    all_conditions_met = False
+                                    break
+
+                        elif "indices_ready" in condition:
+                            if condition["indices_ready"]:
+                                health = client.health()
+                                unassigned = health.get("unassigned_shards", 0)
+                                if unassigned > 0:
+                                    self.logger.info(
+                                        f"Found {unassigned} unassigned shards, waiting..."
+                                    )
+                                    all_conditions_met = False
+                                    break
+
+                    if not all_conditions_met:
+                        raise Exception("Not all readiness conditions met yet")
+
+                    return ActionResult(
+                        True,
+                        f"All readiness conditions met for cluster '{cluster_name}'",
+                    )
+
+                finally:
+                    client.disconnect()
+
+            return _wait_for_ready()
+
+        except StopRetryingException as e:
+            return ActionResult(False, str(e))
+        except RetryError:
             return ActionResult(
                 False, f"Timeout waiting for cluster readiness after {timeout_str}"
             )
-
         except Exception as e:
             return ActionResult(False, f"Error waiting for cluster readiness: {e}")
 
@@ -1392,108 +1332,70 @@ class ValidateClusterConfigurationAction(BaseAction):
             f"Validating cluster configuration (timeout: {timeout_str}, retry interval: {retry_interval_str})"
         )
 
+        validation_results = []
+
+        @oko_retry(timeout, retry_interval)
+        def _validate_configuration():
+            nonlocal validation_results
+            validation_results = []
+            all_passed = True
+
+            # Recreate client on each attempt
+            client = KubernetesOpenSearchClient.from_security_config(
+                self.config.opensearch.security, namespace, service_name
+            )
+
+            with client:
+                # Validate cluster settings
+                if cluster_settings:
+                    result = self._validate_cluster_settings(client, cluster_settings)
+                    validation_results.append(result)
+                    if not result["success"]:
+                        all_passed = False
+
+                # Validate index settings
+                if index_settings:
+                    result = self._validate_index_settings(client, index_settings)
+                    validation_results.append(result)
+                    if not result["success"]:
+                        all_passed = False
+
+                # Validate node role distribution
+                if node_role_distribution:
+                    result = self._validate_node_role_distribution(
+                        client, node_role_distribution
+                    )
+                    validation_results.append(result)
+                    if not result["success"]:
+                        all_passed = False
+
+                # Validate security settings
+                if security_settings:
+                    result = self._validate_security_settings(client, security_settings)
+                    validation_results.append(result)
+                    if not result["success"]:
+                        all_passed = False
+
+                # Validate plugin settings
+                if plugin_settings:
+                    result = self._validate_plugin_settings(client, plugin_settings)
+                    validation_results.append(result)
+                    if not result["success"]:
+                        all_passed = False
+
+            # If all validations passed, return success
+            if all_passed:
+                return
+
+            # If we have failures, log and retry
+            failed_checks = [r["check"] for r in validation_results if not r["success"]]
+            self.logger.debug(f"Validation checks failed: {failed_checks}. Retrying...")
+            raise Exception(f"Validation checks failed: {failed_checks}")
+
         try:
-            start_time = time.time()
-            client = None
-
-            # Retry loop to wait for cluster to be ready
-            while time.time() - start_time < timeout:
-                try:
-                    validation_results = []
-                    all_passed = True
-
-                    # Establish client connection
-                    if client is None:
-                        client = KubernetesOpenSearchClient.from_security_config(
-                            self.config.opensearch.security, namespace, service_name
-                        )
-
-                    with client:
-                        # Validate cluster settings (these don't usually need retries)
-                        if cluster_settings:
-                            result = self._validate_cluster_settings(
-                                client, cluster_settings
-                            )
-                            validation_results.append(result)
-                            if not result["success"]:
-                                all_passed = False
-
-                        # Validate index settings (these don't usually need retries)
-                        if index_settings:
-                            result = self._validate_index_settings(
-                                client, index_settings
-                            )
-                            validation_results.append(result)
-                            if not result["success"]:
-                                all_passed = False
-
-                        # Validate node role distribution (this is the critical one that needs retries)
-                        if node_role_distribution:
-                            result = self._validate_node_role_distribution(
-                                client, node_role_distribution
-                            )
-                            validation_results.append(result)
-                            if not result["success"]:
-                                all_passed = False
-
-                        # Validate security settings (these don't usually need retries)
-                        if security_settings:
-                            result = self._validate_security_settings(
-                                client, security_settings
-                            )
-                            validation_results.append(result)
-                            if not result["success"]:
-                                all_passed = False
-
-                        # Validate plugin settings (these don't usually need retries)
-                        if plugin_settings:
-                            result = self._validate_plugin_settings(
-                                client, plugin_settings
-                            )
-                            validation_results.append(result)
-                            if not result["success"]:
-                                all_passed = False
-
-                    # If all validations passed, return success
-                    if all_passed:
-                        break
-
-                    # If we have failures, check if we should retry
-                    remaining_time = timeout - (time.time() - start_time)
-                    if remaining_time > retry_interval:
-                        # Log which validations failed and that we're retrying
-                        failed_checks = [
-                            r["check"] for r in validation_results if not r["success"]
-                        ]
-                        self.logger.debug(
-                            f"Validation checks failed: {failed_checks}. Retrying in {retry_interval_str} ({remaining_time:.0f}s remaining)"
-                        )
-                        time.sleep(retry_interval)
-                        continue
-                    else:
-                        # Not enough time for another retry, break and return failure
-                        break
-
-                except Exception as e:
-                    # Connection or other errors - retry if time allows
-                    remaining_time = timeout - (time.time() - start_time)
-                    if remaining_time > retry_interval:
-                        self.logger.info(
-                            f"Validation error: {e}. Retrying in {retry_interval_str} ({remaining_time:.0f}s remaining)"
-                        )
-                        client = None  # Reset client for next attempt
-                        time.sleep(retry_interval)
-                        continue
-                    else:
-                        return ActionResult(False, f"Validation failed with error: {e}")
-
-            # Check if we timed out
-            if time.time() - start_time >= timeout:
-                return ActionResult(False, f"Validation timeout after {timeout_str}")
-
-            # If we're here, we either succeeded or failed after retries
-
-            # Generate summary
+            _validate_configuration()
+        except RetryError:
+            # Generate summary with final validation results
             passed_checks = sum(1 for r in validation_results if r["success"])
             total_checks = len(validation_results)
 
@@ -1511,13 +1413,25 @@ class ValidateClusterConfigurationAction(BaseAction):
                         self.logger.error(f"  Total nodes: {result['total_nodes']}")
 
             summary = f"Cluster configuration validation: {passed_checks}/{total_checks} checks passed"
-
             return ActionResult(
-                all_passed, summary, {"validation_details": validation_results}
+                False, f"Validation timeout after {timeout_str}: {summary}"
             )
-
         except Exception as e:
             return ActionResult(False, f"Failed to validate cluster configuration: {e}")
+
+        # Success case - generate summary
+        passed_checks = sum(1 for r in validation_results if r["success"])
+        total_checks = len(validation_results)
+
+        # Log detailed results
+        for result in validation_results:
+            if result["success"]:
+                self.logger.info(f"✓ {result['check']}: {result['message']}")
+            else:
+                self.logger.error(f"✗ {result['check']}: {result['message']}")
+
+        summary = f"Cluster configuration validation: {passed_checks}/{total_checks} checks passed"
+        return ActionResult(True, summary, {"validation_details": validation_results})
 
     def _validate_cluster_settings(
         self, client: KubernetesOpenSearchClient, cluster_settings: Dict[str, Any]

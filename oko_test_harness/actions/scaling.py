@@ -2,11 +2,13 @@
 
 import json
 import subprocess
-import time
 from typing import Any, Dict
+
+from tenacity import RetryError
 
 from oko_test_harness.actions.base import BaseAction
 from oko_test_harness.models.playbook import ActionResult
+from oko_test_harness.retry_utils import oko_retry
 from oko_test_harness.utils.opensearch_client import KubernetesOpenSearchClient
 
 
@@ -55,9 +57,11 @@ class ScaleClusterAction(BaseAction):
 
             # Wait for scaling to complete
             timeout = self._parse_duration(timeout_str)
-            if not self._wait_for_scaling_completion(
-                namespace, node_type, target_count, timeout
-            ):
+            try:
+                self._wait_for_scaling_completion(
+                    namespace, node_type, target_count, timeout
+                )
+            except RetryError:
                 return ActionResult(False, "Scaling operation timed out")
 
             # Wait for cluster health if requested
@@ -81,49 +85,46 @@ class ScaleClusterAction(BaseAction):
 
     def _wait_for_scaling_completion(
         self, namespace: str, node_type: str, target_count: int, timeout: int
-    ) -> bool:
+    ) -> None:
         """Wait for scaling operation to complete."""
-        start_time = time.time()
-
         label_selector = f"opensearch.role/{node_type}=true"
         if node_type == "master":
             label_selector = "opensearch.role/master=true"
         elif node_type == "data":
-            label_selector = "opensearch.role/data=true"
+            label_selector = "opensearch.role/data=True"
 
-        while time.time() - start_time < timeout:
-            try:
-                result = subprocess.run(
-                    [
-                        "kubectl",
-                        "get",
-                        "pods",
-                        "-n",
-                        namespace,
-                        "-l",
-                        label_selector,
-                        "--field-selector",
-                        "status.phase=Running",
-                        "-o",
-                        "json",
-                    ],
-                    capture_output=True,
-                    text=True,
-                )
+        @oko_retry(timeout, 30)
+        def _check_pods_running():
+            result = subprocess.run(
+                [
+                    "kubectl",
+                    "get",
+                    "pods",
+                    "-n",
+                    namespace,
+                    "-l",
+                    label_selector,
+                    "--field-selector",
+                    "status.phase=Running",
+                    "-o",
+                    "json",
+                ],
+                capture_output=True,
+                text=True,
+            )
 
-                if result.returncode == 0:
-                    pods_data = json.loads(result.stdout)
-                    running_pods = len(pods_data.get("items", []))
+            if result.returncode == 0:
+                pods_data = json.loads(result.stdout)
+                running_pods = len(pods_data.get("items", []))
 
-                    if running_pods >= target_count:
-                        return True
+                if running_pods >= target_count:
+                    return
 
-                time.sleep(30)
-            except Exception as e:
-                self.logger.warning(f"Error checking scaling progress: {e}")
-                time.sleep(30)
+            raise Exception(
+                f"Waiting for {target_count} pods, currently have {running_pods if result.returncode == 0 else 'unknown'}"
+            )
 
-        return False
+        _check_pods_running()
 
 
 class ScaleDownClusterAction(BaseAction):
@@ -185,9 +186,11 @@ class ScaleDownClusterAction(BaseAction):
 
             # Wait for scaling to complete
             timeout = self._parse_duration(force_after_timeout)
-            if not self._wait_for_scale_down_completion(
-                namespace, node_type, target_count, timeout
-            ):
+            try:
+                self._wait_for_scale_down_completion(
+                    namespace, node_type, target_count, timeout
+                )
+            except RetryError:
                 return ActionResult(False, "Scale down operation timed out")
 
             return ActionResult(
@@ -245,14 +248,17 @@ class ScaleDownClusterAction(BaseAction):
 
     def _wait_for_scale_down_completion(
         self, namespace: str, node_type: str, target_count: int, timeout: int
-    ) -> bool:
+    ) -> None:
         """Wait for scale down operation to complete."""
-        start_time = time.time()
 
-        while time.time() - start_time < timeout:
+        @oko_retry(timeout, 30)
+        def _check_scale_down():
             current_count = self._get_current_node_count(namespace, node_type)
             if current_count <= target_count:
-                return True
-            time.sleep(30)
+                return
 
-        return False
+            raise Exception(
+                f"Waiting for node count to reach {target_count}, currently at {current_count}"
+            )
+
+        _check_scale_down()
