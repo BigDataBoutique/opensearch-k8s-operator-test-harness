@@ -44,6 +44,7 @@ class PlaybookExecutor:
             ValidateOperatorStatusAction,
             ValidateClusterConfigurationAction,
             ValidateNodeConfigurationAction,
+            ValidateCoordinatorNodesAction,
         )
         from oko_test_harness.actions.chaos import (
             InjectPodFailureAction,
@@ -82,6 +83,7 @@ class PlaybookExecutor:
             ValidateOperatorStatusAction,
             ValidateClusterConfigurationAction,
             ValidateNodeConfigurationAction,
+            ValidateCoordinatorNodesAction,
             InjectPodFailureAction,
             InjectNodeFailureAction,
             InjectNetworkPartitionAction,
