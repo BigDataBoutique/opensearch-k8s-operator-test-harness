@@ -1,0 +1,135 @@
+metadata:
+  description: "Test coordinator nodes with empty roles array - Issue #1023"
+  tags: ["bug-reproduction", "coordinator", "node-roles"]
+
+config:
+  kubernetes:
+    cluster_name: "coordinator-test"
+    nodes: 3
+
+phases:
+  - name: "setup"
+    description: "Initialize test environment"
+    steps:
+      - action: setup_cluster
+        params:
+          nodes: 3
+          kubernetes_version: "v1.30.0"
+      - action: install_operator
+        params:
+          version: "latest"
+          namespace: "opensearch-system"
+
+  - name: "deploy_coordinator_cluster"
+    description: "Deploy cluster with dedicated coordinator nodes (roles: [])"
+    steps:
+      - action: deploy_cluster
+        params:
+          cluster_name: "test-coordinator-cluster"
+          version: "3.3.2"
+          dashboards:
+            enabled: false
+          storage:
+            class: "standard"
+            size: "10Gi"
+          node_pools:
+            # Data and master nodes
+            - component: "masters"
+              roles: ["cluster_manager", "data", "ingest"]
+              replicas: 3
+              resources:
+                requests:
+                  memory: "2Gi"
+                  cpu: "1"
+                limits:
+                  memory: "4Gi"
+                  cpu: "2"
+              jvm: "-Xmx1G -Xms1G"
+            # Dedicated coordinator nodes with empty roles
+            - component: "coordinators"
+              roles: []
+              replicas: 1
+              resources:
+                requests:
+                  memory: "4Gi"
+                  cpu: "2"
+                limits:
+                  memory: "8Gi"
+                  cpu: "8"
+              jvm: "-Xmx4G -Xms4G"
+      - action: wait_for_cluster_ready
+        params:
+          timeout: "15m"
+          conditions:
+            - cluster_health: "yellow"
+            - all_nodes_ready: true
+      - action: update_cluster_allocation_settings
+        params:
+          allocation_enable: "all"
+
+  - name: "validate_coordinator_roles"
+    description: "Verify coordinator nodes have correct roles (should be '-', not 'dimr')"
+    steps:
+      - action: validate_cluster_health
+        params:
+          expected_status: "green"
+          check_nodes: true
+      - action: validate_cluster_configuration
+        params:
+          total_nodes:
+            expected: 4
+          node_role_distribution:
+            cluster_manager:
+              minimum: 3
+              maximum: 3
+            data:
+              minimum: 3
+              maximum: 3
+            ingest:
+              minimum: 3
+              maximum: 3
+            # Coordinator nodes should NOT have any roles
+            # They should show as "-" in node.role column
+      - action: validate_coordinator_nodes
+        params:
+          expected_count: 1
+
+  - name: "data_operations"
+    description: "Test that coordinators can route requests without storing data"
+    steps:
+      - action: index_documents
+        params:
+          count: 1000
+          index: "coordinator-test-{timestamp}"
+          bulk_size: 100
+          replicas: 1
+          shards: 3
+          document_template: |
+            {
+              "id": {id},
+              "timestamp": "{timestamp}",
+              "message": "Test document {id} routed through coordinator",
+              "test_type": "coordinator_routing"
+            }
+      - action: validate_data_integrity
+        params:
+          indices: ["coordinator-test-*"]
+          expected_documents: 1000
+          sample_queries:
+            - query: '{"match_all": {}}'
+              expected_hits: 1000
+            - query: '{"term": {"test_type": "coordinator_routing"}}'
+              expected_hits: 1000
+
+  - name: "cleanup"
+    description: "Clean up test resources"
+    steps:
+      - action: delete_cluster
+        params:
+          cluster_name: "test-coordinator-cluster"
+          force: false
+          wait_for_completion: true
+      - action: cleanup_cluster
+        params:
+          remove_cluster: true
+          cleanup_docker: true
