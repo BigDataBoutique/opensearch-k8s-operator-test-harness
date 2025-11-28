@@ -621,7 +621,7 @@ class ValidateNodeConfigurationAction(BaseAction):
             if node_group == "all":
                 label_selector = f"opster.io/opensearch-cluster={cluster_name}"
             else:
-                label_selector = f"opster.io/opensearch-cluster={cluster_name},opensearch.role={node_group}"
+                label_selector = f"opster.io/opensearch-cluster={cluster_name},opster.io/opensearch-nodepool={node_group}"
 
             pods = k8s_manager.get_pods(namespace, label_selector=label_selector)
 
@@ -2259,3 +2259,83 @@ class ValidateNetworkConfigurationAction(BaseAction):
                 "check": "dns_resolution",
                 "message": f"Error validating DNS resolution: {e}",
             }
+
+
+class ValidateCoordinatorNodesAction(BaseAction):
+    """Action to validate coordinator nodes have no roles assigned."""
+
+    action_name = "validate_coordinator_nodes"
+
+    def execute(self, params: Dict[str, Any]) -> ActionResult:
+        params = self._merge_params(params)
+
+        namespace = params.get("namespace", self.config.opensearch.operator_namespace)
+        service_name = params.get("service_name", self.config.opensearch.service_name)
+        expected_count = params.get("expected_count")
+        timeout_str = params.get("timeout", "2m")
+        retry_interval_str = params.get("retry_interval", "10s")
+
+        timeout = self._parse_duration(timeout_str)
+        retry_interval = self._parse_duration(retry_interval_str)
+
+        self.logger.info("Validating coordinator nodes have no roles")
+
+        @oko_retry(timeout, retry_interval)
+        def _validate_coordinators():
+            client = KubernetesOpenSearchClient.from_security_config(
+                self.config.opensearch.security, namespace, service_name
+            )
+
+            with client:
+                # Get node info to analyze roles
+                node_info = client.get_nodes_info()
+
+                if not node_info or "nodes" not in node_info:
+                    raise Exception("Failed to get node information")
+
+                coordinator_nodes = []
+                non_coordinator_nodes = []
+
+                for node_id, node_data in node_info["nodes"].items():
+                    node_name = node_data.get("name", node_id)
+                    roles = node_data.get("roles", [])
+
+                    if len(roles) == 0:
+                        coordinator_nodes.append(node_name)
+                    else:
+                        non_coordinator_nodes.append({"name": node_name, "roles": roles})
+
+                # Check if we found the expected number of coordinators
+                coordinator_count = len(coordinator_nodes)
+
+                if expected_count is not None and coordinator_count != expected_count:
+                    raise Exception(
+                        f"Expected {expected_count} coordinator nodes, found {coordinator_count}"
+                    )
+
+                if coordinator_count == 0:
+                    raise Exception("No coordinator nodes (nodes with empty roles) found")
+
+                return {
+                    "coordinator_count": coordinator_count,
+                    "coordinator_nodes": coordinator_nodes,
+                    "non_coordinator_nodes": non_coordinator_nodes,
+                }
+
+        try:
+            result = _validate_coordinators()
+
+            coordinator_count = result["coordinator_count"]
+            coordinator_nodes = result["coordinator_nodes"]
+
+            message = f"Found {coordinator_count} coordinator node(s) with no roles: {', '.join(coordinator_nodes)}"
+
+            return ActionResult(True, message, result)
+
+        except RetryError:
+            return ActionResult(
+                False,
+                f"Validation timeout after {timeout_str}: Failed to validate coordinator nodes",
+            )
+        except Exception as e:
+            return ActionResult(False, f"Failed to validate coordinator nodes: {e}")
