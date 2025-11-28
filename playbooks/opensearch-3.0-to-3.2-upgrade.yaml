@@ -1,15 +1,15 @@
 metadata:
-  description: "3-node OpenSearch 2.9 to 2.17 minor upgrade test with data validation"
+  description: "3-node OpenSearch 3.0 to 3.2 minor upgrade test with data validation"
 
 config:
   kubernetes:
-    cluster_name: "opensearch-upgrade-2.9-2.17"
+    cluster_name: "opensearch-upgrade-3.0-3.2"
     nodes: 3  # 3-node cluster for OpenSearch operator requirements
 
 
 phases:
   - name: "setup"
-    description: "Deploy 3-node cluster with OpenSearch 2.9"
+    description: "Deploy 3-node cluster with OpenSearch 3.0"
     steps:
       - action: setup_cluster
         params:
@@ -18,11 +18,11 @@ phases:
       - action: deploy_cluster
         params:
           cluster_name: "upgrade-test-cluster"
-          version: "2.9.0"
+          version: "3.0.0"
           dashboards:
             enabled: false  # Disable dashboards for faster startup
             replicas: 0
-            version: "2.9.0"
+            version: "3.0.0"
           cluster_settings:
             # Set disk watermarks appropriate for test environments with constrained disk space
             "cluster.routing.allocation.disk.watermark.low": "95%"
@@ -63,12 +63,12 @@ phases:
               maximum: 3
 
   - name: "create_test_data"
-    description: "Create test data in OpenSearch 2.9"
+    description: "Create test data in OpenSearch 3.0"
     steps:
       - action: index_documents
         params:
           count: 2000
-          index: "test-data-v2.9"
+          index: "test-data-v3.0"
           bulk_size: 100
           replicas: 2  # Use 2 replicas to ensure green status requires all 3 nodes
           shards: 1
@@ -76,8 +76,8 @@ phases:
             {
               "id": {id},
               "timestamp": "{timestamp}",
-              "version": "2.9",
-              "message": "Test document created in OpenSearch 2.9 - {id}",
+              "version": "3.0",
+              "message": "Test document created in OpenSearch 3.0 - {id}",
               "category": "{random:analytics,logs,metrics,events}",
               "level": "{random:INFO,WARN,ERROR,DEBUG}",
               "service": "{random:web,api,db,cache,queue}",
@@ -89,14 +89,14 @@ phases:
             }
       - action: validate_data_integrity
         params:
-          indices: ["test-data-v2.9"]
+          indices: ["test-data-v3.0"]
           expected_documents: 2000
           sample_queries:
             - query: '{"match_all": {}}'
               expected_hits: 2000
 
-  - name: "upgrade_to_2.17"
-    description: "Upgrade OpenSearch from 2.9 to 2.17"
+  - name: "upgrade_to_3.2"
+    description: "Upgrade OpenSearch from 3.0 to 3.2"
     steps:
       - action: validate_cluster_health
         params:
@@ -104,7 +104,7 @@ phases:
           timeout: "10m"
       - action: upgrade_cluster
         params:
-          target_version: "2.17.0"
+          target_version: "3.2.0"
           strategy: "rolling"
           max_unavailable: 0  # Careful rolling upgrade
           # Validation steps are executed during the rolling upgrade process
@@ -128,7 +128,7 @@ phases:
             - indices_ready: true
 
   - name: "post_upgrade_validation"
-    description: "Validate cluster after upgrade to 2.17"
+    description: "Validate cluster after upgrade to 3.2"
     steps:
       - action: update_cluster_allocation_settings
         params:
@@ -141,22 +141,22 @@ phases:
           check_indices: true
       - action: validate_data_integrity
         params:
-          indices: ["test-data-v2.9"]
+          indices: ["test-data-v3.0"]
           expected_documents: 2000
           checksum_validation: true
           sample_queries:
             - query: '{"match_all": {}}'
               expected_hits: 2000
-            - query: '{"term": {"version": "2.9"}}'
+            - query: '{"term": {"version": "3.0"}}'
               expected_hits: 2000
       - action: query_documents
         params:
-          index: "test-data-v2.9"
-          query: '{"bool": {"must": [{"term": {"version": "2.9"}}, {"range": {"value": {"gte": 100, "lte": 200}}}]}}'
+          index: "test-data-v3.0"
+          query: '{"bool": {"must": [{"term": {"version": "3.0"}}, {"range": {"value": {"gte": 100, "lte": 200}}}]}}'
           expected_min_count: 50
 
-  - name: "new_data_in_2.17"
-    description: "Create new data in OpenSearch 2.17"
+  - name: "new_data_in_3.2"
+    description: "Create new data in OpenSearch 3.2"
     steps:
       - action: update_cluster_allocation_settings
         params:
@@ -164,7 +164,7 @@ phases:
       - action: index_documents
         params:
           count: 1500
-          index: "test-data-v2.17"
+          index: "test-data-v3.2"
           bulk_size: 100
           replicas: 2  # Use 2 replicas to ensure all nodes are working
           shards: 1
@@ -172,13 +172,13 @@ phases:
             {
               "id": {id},
               "timestamp": "{timestamp}",
-              "version": "2.17",
-              "message": "Test document created in OpenSearch 2.17 - {id}",
+              "version": "3.2",
+              "message": "Test document created in OpenSearch 3.2 - {id}",
               "category": "{random:analytics,logs,metrics,events}",
               "level": "{random:INFO,WARN,ERROR,DEBUG}",
               "service": "{random:web,api,db,cache,queue}",
               "value": {id},
-              "minor_upgrade": "2.9_to_2.17",
+              "minor_upgrade": "3.0_to_3.2",
               "compatibility_data": {
                 "backward_compatible": true,
                 "feature_enhanced": true
@@ -186,12 +186,12 @@ phases:
             }
       - action: validate_data_integrity
         params:
-          indices: ["test-data-v2.17"]
+          indices: ["test-data-v3.2"]
           expected_documents: 1500
           sample_queries:
-            - query: '{"term": {"version": "2.17"}}'
+            - query: '{"term": {"version": "3.2"}}'
               expected_hits: 1500
-            - query: '{"term": {"minor_upgrade": "2.9_to_2.17"}}'
+            - query: '{"term": {"minor_upgrade": "3.0_to_3.2"}}'
               expected_hits: 1500
 
   - name: "cluster_health_final"
