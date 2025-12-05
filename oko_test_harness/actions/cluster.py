@@ -825,8 +825,6 @@ spec:
         name: {security_secret_name}
       adminCredentialsSecret:
         name: {admin_secret_name}
-      adminSecret:
-        name: {name}-admin-cert
     tls:
       transport:
         generate: true
