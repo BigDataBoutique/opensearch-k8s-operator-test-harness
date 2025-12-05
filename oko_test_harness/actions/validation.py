@@ -1,6 +1,7 @@
 """Validation and monitoring actions."""
 
 import json
+import subprocess
 import time
 from typing import Any, Dict, List
 
@@ -2339,3 +2340,72 @@ class ValidateCoordinatorNodesAction(BaseAction):
             )
         except Exception as e:
             return ActionResult(False, f"Failed to validate coordinator nodes: {e}")
+
+
+class ValidateClusterVersionAction(BaseAction):
+    """Action to validate OpenSearch cluster version via REST API."""
+
+    action_name = "validate_cluster_version"
+
+    def execute(self, params: Dict[str, Any]) -> ActionResult:
+        params = self._merge_params(params)
+
+        expected_version = params.get("expected_version")
+        timeout_str = params.get("timeout", "5m")
+        retry_interval_str = params.get("retry_interval", "10s")
+        namespace = params.get("namespace", self.config.opensearch.operator_namespace)
+        service_name = params.get("service_name", self.config.opensearch.cluster_name)
+
+        if not expected_version:
+            return ActionResult(False, "expected_version parameter is required")
+
+        timeout = self._parse_duration(timeout_str)
+        retry_interval = self._parse_duration(retry_interval_str)
+
+        self.logger.info(f"Validating cluster version (expecting {expected_version})")
+
+        @oko_retry(timeout, retry_interval)
+        def _validate_version():
+            client = KubernetesOpenSearchClient.from_security_config(
+                self.config.opensearch.security, namespace, service_name
+            )
+            if not client.connect(quiet=True):
+                raise Exception("Could not connect to OpenSearch cluster")
+
+            try:
+                response = client.session.get(f"{client.base_url}/")
+                if response.status_code != 200:
+                    raise Exception(
+                        f"Failed to get cluster info: HTTP {response.status_code}"
+                    )
+
+                version_data = response.json()
+                actual_version = version_data.get("version", {}).get("number")
+
+                if not actual_version:
+                    raise Exception("Version number not found in API response")
+
+                self.logger.info(f"Detected cluster version: {actual_version}")
+
+                if actual_version != expected_version:
+                    raise Exception(
+                        f"Version mismatch: expected {expected_version}, got {actual_version}"
+                    )
+
+                return ActionResult(
+                    True,
+                    f"Cluster version verified as {expected_version}",
+                    {"version": actual_version},
+                )
+            finally:
+                client.disconnect()
+
+        try:
+            return _validate_version()
+        except RetryError:
+            return ActionResult(
+                False,
+                f"Failed to verify cluster version {expected_version} within {timeout_str}",
+            )
+        except Exception as e:
+            return ActionResult(False, f"Failed to validate cluster version: {e}")
