@@ -1,0 +1,50 @@
+metadata:
+  description: "persistence.emptyDir pools get no PVCs; a deleted pod comes back empty and the cluster recovers its data from replicas with no document loss"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          drain_data_nodes: true
+          extra_spec:
+            nodePools:
+              - component: nodes
+                replicas: 3
+                roles: ["cluster_manager", "data", "ingest"]
+                diskSize: 5Gi
+                resources: {requests: {cpu: 250m, memory: 1Gi}, limits: {cpu: "2", memory: 2Gi}}
+                jvm: "-Xmx768m -Xms768m"
+                persistence: {emptyDir: {}}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 3000, shards: 3, replicas: 1}
+
+  - name: verify
+    steps:
+      - action: check_k8s_resource
+        params: {kind: pvc, exists: false}
+      - action: check_k8s_resource
+        params: {kind: pod, component: nodes, expect: {spec.volumes: [{name: data, emptyDir: {}}]}}
+      - action: validate_node_configuration
+
+  - name: pod_loss_recovers_from_replicas
+    steps:
+      - action: inject_pod_failure
+        params: {count: 1, method: delete, indices: [data-a]}
+      - action: wait_for_cluster_ready
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 3000}
+      - action: inject_pod_failure
+        params: {target: master, method: force_delete, indices: [data-a]}
+      - action: wait_for_cluster_ready
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 3000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

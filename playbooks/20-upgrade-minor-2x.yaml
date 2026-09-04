@@ -1,0 +1,41 @@
+metadata:
+  description: "Minor upgrade within 2.x under indexing load: 2.18.0 -> ${OS_VERSION_2X:-2.19.6}"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_2X_OLD:-2.18.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-old, count: 5000, shards: 3, replicas: 1}
+
+  - name: upgrade
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, shards: 2, replicas: 1, duration: 8m, min_success_ratio: 0.95}
+      - action: upgrade_cluster
+        params: {target_version: "${OS_VERSION_2X:-2.19.6}", max_unready_pods: 1, min_health: yellow}
+
+  - name: verify
+    steps:
+      - action: wait_for_cluster_ready
+        params: {expect_version: "${OS_VERSION_2X:-2.19.6}"}
+      - action: validate_cluster_version
+        params: {expected_version: "${OS_VERSION_2X:-2.19.6}"}
+      - action: validate_data_integrity
+        params: {index: data-old, expected_documents: 5000}
+      - action: query_documents
+        params: {index: data-live, expected_min_count: 5000}
+      - action: validate_node_configuration
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

@@ -1,0 +1,81 @@
+metadata:
+  description: "nodePools[].nodeSelector, tolerations, topologySpreadConstraints, affinity and pdb reach the pods and PDB objects; changing scheduling constraints rolls the pool one pod at a time; an invalid pdb (both minAvailable and maxUnavailable) is reported as a Warning event and skipped"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          node_pools:
+            - component: nodes
+              replicas: 3
+              roles: ["cluster_manager", "data", "ingest"]
+              nodeSelector: {"kubernetes.io/os": linux}
+              tolerations: [{key: oko/test, operator: Exists, effect: NoSchedule}]
+              labels: {oko/pool: nodes}
+              annotations: {oko/annotated: "yes"}
+              pdb: {enable: true, minAvailable: 2}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 1000, shards: 3, replicas: 1}
+
+  - name: verify
+    steps:
+      - action: check_k8s_resource
+        params:
+          kind: pod
+          component: nodes
+          expect:
+            spec.nodeSelector: {"kubernetes.io/os": linux}
+            spec.tolerations: [{key: oko/test, operator: Exists, effect: NoSchedule}]
+            metadata.labels: {oko/pool: nodes}
+            metadata.annotations: {oko/annotated: "yes"}
+      - action: check_k8s_resource
+        params:
+          kind: poddisruptionbudget
+          name: __CLUSTER__-nodes-pdb
+          expect: {spec.minAvailable: 2, status.expectedPods: 3}
+
+  - name: scheduling_change
+    steps:
+      - action: patch_cluster
+        params:
+          expect_restart: true
+          wait_running: true
+          node_pool:
+            component: nodes
+            topologySpreadConstraints: [{maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: ScheduleAnyway, labelSelector: {matchLabels: {oko/pool: nodes}}}]
+            affinity: {podAntiAffinity: {preferredDuringSchedulingIgnoredDuringExecution: [{weight: 100, podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {oko/pool: nodes}}}}]}}
+      - action: wait_for_cluster_ready
+      - action: check_k8s_resource
+        params:
+          kind: pod
+          component: nodes
+          expect:
+            spec.topologySpreadConstraints: [{maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: ScheduleAnyway}]
+            spec.affinity.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution: [{weight: 100}]
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 1000}
+
+  - name: invalid_pdb
+    steps:
+      - action: patch_cluster
+        params: {node_pool: {component: nodes, pdb: {enable: true, minAvailable: 2, maxUnavailable: 1}}}
+      - action: expect_event
+        params: {reason: PDB, type: Warning, contains: "only one parameter"}
+      - action: patch_cluster
+        params: {node_pool: {component: nodes, pdb: {enable: true, maxUnavailable: 1}}, wait_running: true}
+      - action: check_k8s_resource
+        params: {kind: poddisruptionbudget, name: __CLUSTER__-nodes-pdb, expect: {spec.maxUnavailable: 1}}
+      - action: patch_cluster
+        params: {node_pool: {component: nodes, pdb: {enable: false}}, wait_running: true}
+      - action: check_k8s_resource
+        params: {kind: poddisruptionbudget, name: __CLUSTER__-nodes-pdb, exists: false}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

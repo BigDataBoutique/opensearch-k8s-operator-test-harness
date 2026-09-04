@@ -1,0 +1,54 @@
+metadata:
+  description: "3-node OpenSearch 3.x with plugins, custom settings and Dashboards; topology, node config and data checks"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          plugins: ["analysis-icu", "analysis-phonetic"]
+          cluster_settings:
+            "cluster.max_shards_per_node": 2000
+            "indices.recovery.max_bytes_per_sec": "200mb"
+          dashboards: {enabled: true, replicas: 1}
+          node_pools:
+            - component: nodes
+              replicas: 3
+              roles: ["cluster_manager", "data", "ingest"]
+      - action: wait_for_cluster_ready
+
+  - name: validate
+    steps:
+      - action: validate_cluster_version
+        params: {expected_version: "${OS_VERSION_3X:-3.8.0}"}
+      - action: validate_cluster_configuration
+        params:
+          total_nodes: 3
+          roles: {cluster_manager: 3, data: 3, ingest: 3}
+          plugins: ["analysis-icu", "analysis-phonetic"]
+          cluster_settings:
+            "cluster.max_shards_per_node": "2000"
+            "indices.recovery.max_bytes_per_sec": "200mb"
+      - action: validate_node_configuration
+      - action: validate_dashboards
+      - action: validate_operator_status
+
+  - name: data
+    steps:
+      - action: index_documents
+        params: {index: data-a, count: 2000, shards: 3, replicas: 1}
+      - action: validate_data_integrity
+        params:
+          index: data-a
+          expected_documents: 2000
+          sample_queries:
+            - {query: '{"term": {"level": "ERROR"}}', min_hits: 100}
+      - action: validate_cluster_health
+        params: {expected_status: green, expected_nodes: 3}
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

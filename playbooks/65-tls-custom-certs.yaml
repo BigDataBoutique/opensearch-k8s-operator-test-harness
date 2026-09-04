@@ -1,0 +1,115 @@
+metadata:
+  description: "security.tls with user-provided cert-manager certificates (transport, HTTP, admin client cert) instead of generate: true; the operator mounts them, generates no certs of its own, runs securityadmin with the admin cert, and the cluster serves the custom HTTP certificate"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: apply_resource
+        params:
+          manifest: {apiVersion: cert-manager.io/v1, kind: Issuer, metadata: {name: oko-selfsigned}, spec: {selfSigned: {}}}
+      - action: apply_resource
+        params:
+          wait_condition: Ready
+          manifest:
+            apiVersion: cert-manager.io/v1
+            kind: Certificate
+            metadata: {name: oko-ca}
+            spec: {isCA: true, commonName: oko-ca, secretName: oko-ca, privateKey: {algorithm: RSA, size: 2048}, issuerRef: {name: oko-selfsigned, kind: Issuer}}
+      - action: apply_resource
+        params:
+          manifest: {apiVersion: cert-manager.io/v1, kind: Issuer, metadata: {name: oko-ca}, spec: {ca: {secretName: oko-ca}}}
+      - action: apply_resource
+        params:
+          wait_condition: Ready
+          manifest:
+            apiVersion: cert-manager.io/v1
+            kind: Certificate
+            metadata: {name: oko-transport}
+            spec:
+              secretName: oko-transport-cert
+              commonName: __CLUSTER__-node
+              subject: {organizationalUnits: [oko]}
+              usages: [digital signature, key encipherment, server auth, client auth]
+              dnsNames: ["__CLUSTER__-discovery", "__CLUSTER__-discovery.__NAMESPACE__.svc", "*.__CLUSTER__-discovery.__NAMESPACE__.svc.cluster.local"]
+              privateKey: {algorithm: RSA, size: 2048}
+              issuerRef: {name: oko-ca, kind: Issuer}
+      - action: apply_resource
+        params:
+          wait_condition: Ready
+          manifest:
+            apiVersion: cert-manager.io/v1
+            kind: Certificate
+            metadata: {name: oko-http}
+            spec:
+              secretName: oko-http-cert
+              commonName: __CLUSTER__
+              subject: {organizationalUnits: [oko]}
+              usages: [digital signature, key encipherment, server auth]
+              dnsNames: ["__CLUSTER__", "__CLUSTER__.__NAMESPACE__", "__CLUSTER__.__NAMESPACE__.svc", "__CLUSTER__.__NAMESPACE__.svc.cluster.local", "*.__CLUSTER__-discovery.__NAMESPACE__.svc.cluster.local"]
+              privateKey: {algorithm: RSA, size: 2048}
+              issuerRef: {name: oko-ca, kind: Issuer}
+      - action: apply_resource
+        params:
+          wait_condition: Ready
+          manifest:
+            apiVersion: cert-manager.io/v1
+            kind: Certificate
+            metadata: {name: oko-admin}
+            spec:
+              secretName: oko-admin-cert
+              commonName: admin
+              subject: {organizationalUnits: [oko]}
+              usages: [digital signature, key encipherment, client auth]
+              privateKey: {algorithm: RSA, size: 2048}
+              issuerRef: {name: oko-ca, kind: Issuer}
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+          extra_spec:
+            security:
+              config: {adminSecret: {name: oko-admin-cert}}
+              tls:
+                transport: {generate: false, perNode: false, secret: {name: oko-transport-cert}, nodesDn: ["CN=__CLUSTER__-node,OU=oko"]}
+                http: {generate: false, secret: {name: oko-http-cert}, adminDn: ["CN=admin,OU=oko"]}
+      - action: wait_for_cluster_ready
+
+  - name: verify
+    steps:
+      - action: check_k8s_resource
+        params: {kind: secret, name: __CLUSTER__-http-cert, exists: false}
+      - action: check_k8s_resource
+        params: {kind: secret, name: __CLUSTER__-transport-cert, exists: false}
+      - action: check_k8s_resource
+        params: {kind: secret, name: __CLUSTER__-admin-cert, exists: false}
+      - action: check_pod_exec
+        params:
+          all_pods: true
+          command: "jdk/bin/keytool -printcert -file config/tls-http/tls.crt | grep -E 'Owner|Issuer'"
+          contains: ["Owner: CN=__CLUSTER__, OU=oko", "Issuer: CN=oko-ca"]
+      - action: check_pod_exec
+        params:
+          all_pods: true
+          command: "jdk/bin/keytool -printcert -file config/tls-transport/tls.crt | grep -E 'Owner|Issuer'"
+          contains: ["Owner: CN=__CLUSTER__-node, OU=oko", "Issuer: CN=oko-ca"]
+      - action: check_pod_exec
+        params:
+          all_pods: true
+          command: "grep -E 'nodes_dn|admin_dn|pemcert_filepath' config/opensearch.yml"
+          contains: ["CN=__CLUSTER__-node,OU=oko", "CN=admin,OU=oko", "tls-http/tls.crt", "tls-transport/tls.crt"]
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/api/internalusers/admin, status: 200}
+      - action: validate_cluster_configuration
+        params: {total_nodes: 3}
+      - action: index_documents
+        params: {index: data-a, count: 1000, shards: 3, replicas: 1}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 1000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

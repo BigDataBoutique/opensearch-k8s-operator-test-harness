@@ -1,335 +1,143 @@
-"""Data operations actions."""
+"""Data actions: index, query, verify."""
 
 import json
 import random
+import re
 import time
 from datetime import datetime
 from typing import Any, Dict, List
 
-from tenacity import RetryError
-
 from oko_test_harness.actions.base import BaseAction
 from oko_test_harness.models.playbook import ActionResult
-from oko_test_harness.retry_utils import oko_retry
-from oko_test_harness.utils.opensearch_client import KubernetesOpenSearchClient
+
+
+def generate_docs(count: int, template: str = None, start: int = 0) -> List[Dict[str, Any]]:
+    docs = []
+    for i in range(start, start + count):
+        if template:
+            content = template.replace("{id}", str(i)).replace("{timestamp}", datetime.now().isoformat())
+            content = re.sub(r"\{random:([^}]+)\}", lambda m: random.choice([c.strip() for c in m.group(1).split(",")]), content)
+            doc = json.loads(content)
+            doc["id"] = i
+        else:
+            doc = {"id": i, "timestamp": datetime.now().isoformat(), "message": f"Test document {i}", "level": random.choice(["INFO", "WARN", "ERROR"]), "value": i}
+        docs.append(doc)
+    return docs
+
+
+DEFAULT_MAPPINGS = {
+    "dynamic": True,
+    "properties": {"id": {"type": "long"}, "timestamp": {"type": "date"}, "message": {"type": "text"}, "level": {"type": "keyword"}, "version": {"type": "keyword"}, "value": {"type": "long"}},
+}
 
 
 class IndexDocumentsAction(BaseAction):
-    """Action to index documents into OpenSearch."""
+    """Create an index (unless it exists) and bulk-index `count` documents with deterministic ids.
+    With `duration` set, keeps indexing `count`-sized batches at `rate` docs/s for that long (background load)."""
 
     action_name = "index_documents"
+    params = {"index", "count", "shards", "replicas", "bulk_size", "document_template", "duration", "start_id", "recreate", "min_success_ratio", "rate"}
 
-    def execute(self, params: Dict[str, Any]) -> ActionResult:
-        params = self._merge_params(params)
-
-        count = params.get("count", 1000)
-        index = self._substitute_template_vars(params.get("index", "test-index"))
-        document_template = params.get("document_template")
-        bulk_size = params.get("bulk_size", 100)
-        replicas = params.get("replicas", 0)  # Default to 0 replicas for testing
-        shards = params.get("shards", 1)
-        namespace = params.get("namespace", self.config.opensearch.operator_namespace)
-        service_name = params.get("service_name", self.config.opensearch.service_name)
-
-        self.logger.info(f"Indexing {count} documents to index '{index}'")
-
-        # Generate documents once before retry loop
-        documents = self._generate_documents(count, document_template)
-
-        # Log first few documents for debugging
-        if len(documents) > 0:
-            self.logger.info(f"Sample documents to be indexed: {documents[:3]}")
-
-        # Delete and recreate index to ensure proper mapping (outside retry loop)
-        try:
-            client = KubernetesOpenSearchClient.from_security_config(
-                self.config.opensearch.security, namespace, service_name
-            )
-            with client:
+    def execute(self, params):
+        index = params.get("index", "test-data")
+        count = int(params.get("count", 1000))
+        bulk_size = int(params.get("bulk_size", 200))
+        duration = self.timeout(params["duration"]) if params.get("duration") else 0
+        template = params.get("document_template")
+        start = int(params.get("start_id", 0))
+        min_ratio = float(params.get("min_success_ratio", 1.0))
+        rate = float(params.get("rate", 100))  # docs/second while `duration` is set; realistic background load, not an IO stress test
+        with self.os_client() as c:
+            if params.get("recreate", False):
+                c.delete_index(index)
+            if index not in c.user_indices():
+                c.create_index(index, int(params.get("shards", 1)), int(params.get("replicas", 1)), DEFAULT_MAPPINGS)
+            ok = failed = 0
+            deadline = time.time() + duration
+            next_id = start
+            attempts = 0
+            while True:
+                docs = generate_docs(count, template, next_id)
+                next_id += count
                 try:
-                    client.delete_index(index)
-                    self.logger.info(
-                        f"Deleted existing index '{index}' to ensure clean mapping"
-                    )
-                except Exception:
-                    pass  # Index might not exist, which is fine
-
-                # Create index with proper mapping and configurable replicas
-                if not client.create_index(index, replicas=replicas, shards=shards):
-                    return ActionResult(False, f"Failed to create index '{index}'")
-        except Exception as e:
-            return ActionResult(False, f"Failed to prepare index '{index}': {e}")
-
-        # Retry logic for transient connection failures (5 attempts * 10s = 50s)
-        @oko_retry(50, 10)
-        def _index_documents():
-            client = KubernetesOpenSearchClient.from_security_config(
-                self.config.opensearch.security, namespace, service_name
-            )
-            with client:
-                # Index documents
-                successful, failed = client.bulk_index(index, documents, bulk_size)
-
-                if failed == 0:
-                    return ActionResult(
-                        True, f"Successfully indexed {successful} documents"
-                    )
-                elif successful > failed:
-                    return ActionResult(
-                        True,
-                        f"Indexed {successful} documents, {failed} failed",
-                    )
-                else:
-                    raise Exception(
-                        f"Too many failures: indexed {successful} documents, {failed} failed"
-                    )
-
-        try:
-            return _index_documents()
-        except RetryError as e:
-            return ActionResult(
-                False,
-                f"Failed to index documents after 5 attempts: {e.last_attempt.exception()}",
-            )
-
-    def _generate_documents(
-        self, count: int, template: str = None
-    ) -> List[Dict[str, Any]]:
-        """Generate test documents."""
-        documents = []
-
-        for i in range(count):
-            if template:
-                doc = self._generate_from_template(template, i)
-            else:
-                doc = {
-                    "id": i,
-                    "timestamp": datetime.now().isoformat(),
-                    "message": f"Test document {i}",
-                    "level": random.choice(["INFO", "WARN", "ERROR"]),
-                    "service": random.choice(["web", "api", "db"]),
-                    "value": random.randint(1, 1000),
-                }
-            documents.append(doc)
-
-        return documents
-
-    def _generate_from_template(self, template: str, doc_id: int) -> Dict[str, Any]:
-        """Generate document from JSON template."""
-        # Replace template variables
-        content = template.replace("{id}", str(doc_id))
-        content = content.replace("{timestamp}", datetime.now().isoformat())
-
-        # Handle random choices
-        import re
-
-        def replace_random(match):
-            choices = match.group(1).split(",")
-            return random.choice([c.strip() for c in choices])
-
-        content = re.sub(r"\{random:([^}]+)\}", replace_random, content)
-
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            # Fallback to simple document
-            return {"content": content, "id": doc_id}
+                    o, f = c.bulk(index, docs, bulk_size)
+                except Exception as e:  # noqa: BLE001 - under chaos the forward can drop; reconnect and retry the same batch
+                    attempts += 1
+                    self.logger.warning(f"bulk failed ({e}); reconnecting (attempt {attempts})")
+                    c.disconnect()
+                    time.sleep(5)
+                    next_id -= count
+                    try:
+                        c.connect()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    if attempts > 60:
+                        return ActionResult(False, f"Indexing gave up after {attempts} reconnects: {e}")
+                    continue
+                ok, failed = ok + o, failed + f
+                if time.time() >= deadline:
+                    break
+                if duration:
+                    time.sleep(count / rate)
+            try:
+                c.refresh(index)
+                total = c.count(index)
+            except Exception:  # noqa: BLE001 - forward may have died under chaos; one reconnect
+                c.disconnect()
+                c.connect()
+                c.refresh(index)
+                total = c.count(index)
+        ratio = ok / max(ok + failed, 1)
+        msg = f"Indexed {ok} docs into {index} ({failed} failed, {total} total now)"
+        return ActionResult(
+            ratio >= min_ratio, msg if ratio >= min_ratio else msg + f"; success ratio {ratio:.3f} < {min_ratio}", {"indexed": ok, "failed": failed, "index": index, "next_id": next_id}
+        )
 
 
 class QueryDocumentsAction(BaseAction):
-    """Action to query documents from OpenSearch."""
-
     action_name = "query_documents"
+    params = {"index", "query", "expected_count", "expected_min_count"}
 
-    def execute(self, params: Dict[str, Any]) -> ActionResult:
-        params = self._merge_params(params)
-
-        index = params.get("index", "test-index-*")
+    def execute(self, params):
+        index = params.get("index", "test-data")
         query = params.get("query", {"match_all": {}})
-        expected_count = params.get("expected_count")
-        namespace = params.get("namespace", self.config.opensearch.operator_namespace)
-        service_name = params.get("service_name", self.config.opensearch.service_name)
-
-        # Parse query if it's a string
-        if isinstance(query, str):
-            try:
-                query = json.loads(query)
-            except json.JSONDecodeError:
-                return ActionResult(False, f"Invalid query JSON: {query}")
-
-        self.logger.info(f"Querying index '{index}'")
-
-        # Retry logic for transient connection failures (5 attempts * 10s = 50s)
-        @oko_retry(50, 10)
-        def _query_documents():
-            client = KubernetesOpenSearchClient.from_security_config(
-                self.config.opensearch.security, namespace, service_name
-            )
-            with client:
-                # Execute search
-                result = client.search(index, query, size=0)  # Just get count
-                hit_count = result["hits"]["total"]["value"]
-
-                if expected_count is not None:
-                    if hit_count == expected_count:
-                        return ActionResult(
-                            True,
-                            f"Query returned {hit_count} documents as expected",
-                        )
-                    else:
-                        raise Exception(
-                            f"Expected {expected_count} documents, got {hit_count}"
-                        )
-                else:
-                    return ActionResult(True, f"Query returned {hit_count} documents")
-
-        try:
-            return _query_documents()
-        except RetryError as e:
-            return ActionResult(
-                False,
-                f"Failed to query documents after 5 attempts: {e.last_attempt.exception()}",
-            )
+        query = json.loads(query) if isinstance(query, str) else query
+        with self.os_client() as c:
+            c.refresh(index)
+            hits = c.search(index, query)["hits"]["total"]["value"]
+        expected, minimum = params.get("expected_count"), params.get("expected_min_count")
+        if expected is not None and hits != int(expected):
+            return ActionResult(False, f"Query on {index} returned {hits} hits, expected {expected}")
+        if minimum is not None and hits < int(minimum):
+            return ActionResult(False, f"Query on {index} returned {hits} hits, expected at least {minimum}")
+        return ActionResult(True, f"Query on {index} returned {hits} hits")
 
 
-class CreateSnapshotAction(BaseAction):
-    """Action to create a snapshot."""
+class ValidateDataIntegrityAction(BaseAction):
+    """Verify document counts and fetch a random sample of documents by id to prove they are readable."""
 
-    action_name = "create_snapshot"
+    action_name = "validate_data_integrity"
+    params = {"index", "expected_documents", "sample_size", "sample_queries", "max_id"}
 
-    def execute(self, params: Dict[str, Any]) -> ActionResult:
-        params = self._merge_params(params)
-
-        repository = params.get("repository", "test-repo")
-        snapshot_name = self._substitute_template_vars(
-            params.get("snapshot_name", f"snapshot-{int(time.time())}")
-        )
-        indices = params.get("indices", ["*"])
-        include_global_state = params.get("include_global_state", False)
-        namespace = params.get("namespace", self.config.opensearch.operator_namespace)
-        service_name = params.get("service_name", self.config.opensearch.service_name)
-
-        self.logger.info(
-            f"Creating snapshot '{snapshot_name}' in repository '{repository}'"
-        )
-
-        try:
-            client = KubernetesOpenSearchClient.from_security_config(
-                self.config.opensearch.security, namespace, service_name
-            )
-            with client:
-                # First, register the snapshot repository if it doesn't exist
-                repo_body = {
-                    "type": "fs",
-                    "settings": {
-                        "location": f"/usr/share/opensearch/data/snapshots/{repository}",
-                        "compress": True,
-                    },
-                }
-
-                # Try to register the repository
-                response = client.session.put(
-                    f"{client.base_url}/_snapshot/{repository}", json=repo_body
-                )
-
-                if response.status_code not in [200, 201]:
-                    self.logger.warning(
-                        f"Repository registration returned status {response.status_code}: {response.text}"
-                    )
-                    # Try to check if repository already exists
-                    check_response = client.session.get(
-                        f"{client.base_url}/_snapshot/{repository}"
-                    )
-                    if check_response.status_code != 200:
-                        return ActionResult(
-                            False, f"Failed to register repository: {response.text}"
-                        )
-                    else:
-                        self.logger.info(f"Repository '{repository}' already exists")
-
-                # Wait a moment for repository to be ready
-                time.sleep(1)
-
-                # Create snapshot
-                snapshot_body = {
-                    "indices": ",".join(indices)
-                    if isinstance(indices, list)
-                    else indices,
-                    "include_global_state": include_global_state,
-                }
-
-                response = client.session.put(
-                    f"{client.base_url}/_snapshot/{repository}/{snapshot_name}",
-                    json=snapshot_body,
-                )
-
-                if response.status_code in [200, 201]:
-                    return ActionResult(
-                        True, f"Snapshot '{snapshot_name}' created successfully"
-                    )
-                else:
-                    return ActionResult(
-                        False, f"Failed to create snapshot: {response.text}"
-                    )
-
-        except Exception as e:
-            return ActionResult(False, f"Failed to create snapshot: {e}")
-
-
-class RestoreSnapshotAction(BaseAction):
-    """Action to restore a snapshot."""
-
-    action_name = "restore_snapshot"
-
-    def execute(self, params: Dict[str, Any]) -> ActionResult:
-        params = self._merge_params(params)
-
-        repository = params.get("repository", "test-repo")
-        snapshot_name = params.get("snapshot_name")
-        target_indices = params.get("target_indices")
-        rename_pattern = params.get("rename_pattern")
-        rename_replacement = params.get("rename_replacement")
-        namespace = params.get("namespace", self.config.opensearch.operator_namespace)
-        service_name = params.get("service_name", self.config.opensearch.service_name)
-
-        if not snapshot_name:
-            return ActionResult(False, "snapshot_name is required")
-
-        self.logger.info(
-            f"Restoring snapshot '{snapshot_name}' from repository '{repository}'"
-        )
-
-        try:
-            client = KubernetesOpenSearchClient.from_security_config(
-                self.config.opensearch.security, namespace, service_name
-            )
-            with client:
-                restore_body = {}
-
-                if target_indices:
-                    restore_body["indices"] = (
-                        ",".join(target_indices)
-                        if isinstance(target_indices, list)
-                        else target_indices
-                    )
-
-                if rename_pattern and rename_replacement:
-                    restore_body["rename_pattern"] = rename_pattern
-                    restore_body["rename_replacement"] = rename_replacement
-
-                response = client.session.post(
-                    f"{client.base_url}/_snapshot/{repository}/{snapshot_name}/_restore",
-                    json=restore_body,
-                )
-
-                if response.status_code == 200:
-                    return ActionResult(
-                        True, f"Snapshot '{snapshot_name}' restored successfully"
-                    )
-                else:
-                    return ActionResult(
-                        False, f"Failed to restore snapshot: {response.text}"
-                    )
-
-        except Exception as e:
-            return ActionResult(False, f"Failed to restore snapshot: {e}")
+    def execute(self, params):
+        index = params.get("index", "test-data")
+        with self.os_client() as c:
+            c.refresh(index)
+            total = c.count(index)
+            expected = params.get("expected_documents")
+            if expected is not None and total != int(expected):
+                return ActionResult(False, f"{index}: {total} documents, expected {expected}")
+            max_id = int(params.get("max_id", total))
+            sample = random.sample(range(max_id), min(int(params.get("sample_size", 50)), max_id)) if max_id else []
+            missing = [i for i in sample if c.get_doc(index, str(i)) is None]
+            if missing:
+                return ActionResult(False, f"{index}: {len(missing)}/{len(sample)} sampled documents missing by id: {missing[:10]}")
+            for q in params.get("sample_queries", []):
+                query = json.loads(q["query"]) if isinstance(q["query"], str) else q["query"]
+                hits = c.search(index, query)["hits"]["total"]["value"]
+                if "expected_hits" in q and hits != int(q["expected_hits"]):
+                    return ActionResult(False, f"{index}: query {query} returned {hits}, expected {q['expected_hits']}")
+                if "min_hits" in q and hits < int(q["min_hits"]):
+                    return ActionResult(False, f"{index}: query {query} returned {hits}, expected at least {q['min_hits']}")
+            health = c.health()
+        return ActionResult(True, f"{index}: {total} documents, {len(sample)} sampled ids readable, cluster {health['status']}", {"count": total})

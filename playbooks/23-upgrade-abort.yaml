@@ -1,0 +1,48 @@
+metadata:
+  description: "Upgrade to a non-existent version gets stuck; reverting the spec must bring the cluster back with no data loss, and a real upgrade must still work afterwards"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X_OLD:-3.0.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 3000, shards: 3, replicas: 1}
+
+  - name: bad_upgrade
+    steps:
+      - action: upgrade_cluster
+        params: {target_version: "3.99.0", wait_for: stuck}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 3000}
+
+  - name: revert
+    steps:
+      - action: upgrade_cluster
+        params: {target_version: "${OS_VERSION_3X_OLD:-3.0.0}", expect_rolling: false, min_health: yellow, max_unready_pods: 1}
+      - action: wait_for_cluster_ready
+        params: {expect_version: "${OS_VERSION_3X_OLD:-3.0.0}"}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 3000}
+      - action: validate_operator_status
+
+  - name: real_upgrade_after_abort
+    steps:
+      - action: upgrade_cluster
+        params: {target_version: "${OS_VERSION_3X:-3.8.0}", max_unready_pods: 1}
+      - action: wait_for_cluster_ready
+        params: {expect_version: "${OS_VERSION_3X:-3.8.0}"}
+      - action: validate_cluster_version
+        params: {expected_version: "${OS_VERSION_3X:-3.8.0}"}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 3000}
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

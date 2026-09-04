@@ -1,0 +1,41 @@
+metadata:
+  description: "Minor upgrade within 3.x with plugins installed: 3.0.x -> latest 3.x"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X_OLD:-3.0.0}"
+          plugins: ["analysis-icu"]
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 4000, shards: 3, replicas: 2}
+
+  - name: upgrade
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 8m, min_success_ratio: 0.95}
+      - action: upgrade_cluster
+        params: {target_version: "${OS_VERSION_3X:-3.8.0}", max_unready_pods: 1}
+
+  - name: verify
+    steps:
+      - action: wait_for_cluster_ready
+        params: {expect_version: "${OS_VERSION_3X:-3.8.0}"}
+      - action: validate_cluster_configuration
+        params: {total_nodes: 3, plugins: ["analysis-icu"]}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 4000}
+      - action: query_documents
+        params: {index: data-live, expected_min_count: 5000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

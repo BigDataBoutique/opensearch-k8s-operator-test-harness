@@ -1,0 +1,35 @@
+metadata:
+  description: "Dedicated coordinator pool with roles: [] (operator issue #1023) routes requests and stores no data"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          node_pools:
+            - component: nodes
+              replicas: 3
+              roles: ["cluster_manager", "data", "ingest"]
+            - component: coordinators
+              replicas: 1
+              roles: []
+      - action: wait_for_cluster_ready
+
+  - name: validate
+    steps:
+      - action: validate_cluster_configuration
+        params:
+          total_nodes: 4
+          roles: {cluster_manager: 3, data: 3, ingest: 3}
+          coordinator_nodes: 1
+      - action: validate_node_configuration
+      - action: index_documents
+        params: {index: data-a, count: 1000, shards: 3, replicas: 1}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 1000}
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

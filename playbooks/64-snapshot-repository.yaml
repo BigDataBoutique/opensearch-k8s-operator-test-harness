@@ -1,0 +1,70 @@
+metadata:
+  description: "general.snapshotRepositories registers an fs repository (single node, emptyDir additionalVolume + path.repo) that can take and restore a snapshot, a settings change is pushed to OpenSearch, and removing the repository from the spec keeps it in OpenSearch (documented)"
+
+# An fs repository must be shared by every node, which no k3d-local volume provides, so this runs on a one-node cluster.
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          cluster_settings: {"path.repo": "/mnt/snapshots"}
+          node_pools:
+            - {component: nodes, replicas: 1, roles: ["cluster_manager", "data", "ingest"]}
+          extra_spec:
+            general:
+              additionalVolumes:
+                - {name: snapshots, path: /mnt/snapshots, emptyDir: {}}
+              snapshotRepositories:
+                - {name: oko-fs, type: fs, settings: {location: /mnt/snapshots, compress: "true"}}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 500, shards: 1, replicas: 0}
+
+  - name: repository
+    steps:
+      - action: check_opensearch_api
+        params:
+          path: /_snapshot/oko-fs
+          expect: {oko-fs.type: fs, oko-fs.settings.location: /mnt/snapshots, oko-fs.settings.compress: "true"}
+      - action: check_opensearch_api
+        params:
+          path: /_snapshot/oko-fs/snap-1?wait_for_completion=true
+          method: PUT
+          body: {indices: data-a, include_global_state: false}
+          expect: {snapshot.state: SUCCESS, snapshot.shards.failed: 0}
+      - action: patch_cluster
+        params:
+          patch: {spec: {general: {snapshotRepositories: [{name: oko-fs, type: fs, settings: {location: /mnt/snapshots, compress: "false"}}]}}}
+      - action: check_opensearch_api
+        params:
+          path: /_snapshot/oko-fs
+          expect: {oko-fs.settings.compress: "false"}
+
+  - name: restore
+    steps:
+      - action: check_opensearch_api
+        params: {path: /data-a, method: DELETE}
+      - action: check_opensearch_api
+        params:
+          path: /_snapshot/oko-fs/snap-1/_restore?wait_for_completion=true
+          method: POST
+          body: {indices: data-a}
+          expect: {snapshot.shards.failed: 0}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 500}
+
+  - name: repository_removal_is_not_deletion
+    steps:
+      - action: patch_cluster
+        params: {patch: {spec: {general: {snapshotRepositories: []}}}}
+      - action: wait_for_cluster_ready
+      - action: check_opensearch_api
+        params: {path: /_snapshot/oko-fs, expect: {oko-fs.type: fs}}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

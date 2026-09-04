@@ -1,0 +1,61 @@
+metadata:
+  description: "Scale data nodes up and down (forcing shard relocation), add and remove a node pool; no data loss, allocation settings restored"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          node_pools:
+            - {component: masters, replicas: 3, roles: ["cluster_manager"]}
+            - {component: data, replicas: 2, roles: ["data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 6000, shards: 4, replicas: 1}
+
+  - name: scale_up
+    steps:
+      - action: scale_cluster
+        params: {component: data, replicas: 4}
+      - action: wait_for_cluster_ready
+      - action: validate_cluster_configuration
+        params: {total_nodes: 7, roles: {cluster_manager: 3, data: 4}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 6000}
+
+  - name: scale_down
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 5m, min_success_ratio: 0.95}
+      - action: scale_cluster
+        params: {component: data, replicas: 2, min_health: yellow, max_unready_pods: 1}
+      - action: wait_for_cluster_ready
+      - action: validate_cluster_configuration
+        params: {total_nodes: 5, roles: {cluster_manager: 3, data: 2}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 6000}
+      - action: validate_node_configuration
+
+  - name: node_pools
+    steps:
+      - action: add_node_pool
+        params:
+          node_pool: {component: ingest, replicas: 2, roles: ["ingest"]}
+      - action: wait_for_cluster_ready
+      - action: validate_cluster_configuration
+        params: {total_nodes: 7, roles: {ingest: 4}}
+      - action: remove_node_pool
+        params: {component: ingest}
+      - action: wait_for_cluster_ready
+      - action: validate_cluster_configuration
+        params: {total_nodes: 5, roles: {cluster_manager: 3, data: 2}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 6000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

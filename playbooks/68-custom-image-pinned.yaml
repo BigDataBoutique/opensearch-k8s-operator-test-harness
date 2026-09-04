@@ -1,0 +1,56 @@
+metadata:
+  description: "general.image pins a custom image: pods run it, a version-only change is denied by the webhook, and changing image + version together rolls the pods to the new image with the documented 'custom image is pinned' Warning instead of an Upgrader run"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X_OLD:-3.0.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+          extra_spec:
+            general: {image: "docker.io/opensearchproject/opensearch:${OS_VERSION_3X_OLD:-3.0.0}", imagePullPolicy: IfNotPresent}
+      - action: wait_for_cluster_ready
+      - action: check_k8s_resource
+        params:
+          kind: pod
+          component: nodes
+          expect: {spec.containers.0.image: "docker.io/opensearchproject/opensearch:${OS_VERSION_3X_OLD:-3.0.0}", spec.containers.0.imagePullPolicy: IfNotPresent}
+      - action: index_documents
+        params: {index: data-a, count: 2000, shards: 3, replicas: 1}
+
+  - name: version_change_without_image_change_is_denied
+    steps:
+      - action: expect_rejected
+        params:
+          patch: {spec: {general: {version: "${OS_VERSION_3X:-3.8.0}"}}}
+          message: "while a custom image is pinned"
+      - action: validate_cluster_version
+        params: {expected_version: "${OS_VERSION_3X_OLD:-3.0.0}"}
+
+  - name: image_and_version_change
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 6m, min_success_ratio: 0.9}
+      - action: patch_cluster
+        params:
+          patch: {spec: {general: {version: "${OS_VERSION_3X:-3.8.0}", image: "docker.io/opensearchproject/opensearch:${OS_VERSION_3X:-3.8.0}"}}}
+          wait_running: true
+      - action: expect_event
+        params: {reason: Upgrade, type: Warning, contains: "custom image is pinned"}
+      - action: wait_for_cluster_ready
+        params: {expect_version: "${OS_VERSION_3X:-3.8.0}"}
+      - action: validate_cluster_version
+        params: {expected_version: "${OS_VERSION_3X:-3.8.0}"}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+      - action: validate_node_configuration
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

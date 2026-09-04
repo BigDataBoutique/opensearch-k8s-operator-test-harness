@@ -1,240 +1,133 @@
-"""Playbook executor for running test scenarios."""
+"""Playbook executor."""
 
+import signal
+import threading
 import time
-from typing import Dict, Any, Type
+from typing import Dict, List, Tuple, Type
+
 from loguru import logger
 
-from oko_test_harness.models.playbook import (
-    Playbook,
-    ExecutionContext,
-    ExecutionStatus,
-    ActionResult,
-    ActionStep,
-)
-from oko_test_harness.actions.base import BaseAction
+from oko_test_harness.actions.base import BaseAction, parse_duration
+from oko_test_harness.models.playbook import ActionResult, ActionStep, ExecutionContext, ExecutionStatus, Playbook
+
+
+def all_actions() -> List[Type[BaseAction]]:
+    from oko_test_harness.actions import chaos, cluster, data, features, monitoring, scaling, upgrade, validation
+
+    found = []
+    for mod in (cluster, data, validation, upgrade, scaling, chaos, monitoring, features):
+        for obj in vars(mod).values():
+            if isinstance(obj, type) and issubclass(obj, BaseAction) and obj is not BaseAction and obj.action_name:
+                found.append(obj)
+    return found
 
 
 class PlaybookExecutor:
-    """Executes playbook phases and steps."""
-
     def __init__(self):
-        self.actions: Dict[str, Type[BaseAction]] = {}
-        self._register_actions()
+        self.actions: Dict[str, Type[BaseAction]] = {a.action_name: a for a in all_actions()}
 
-    def _register_actions(self) -> None:
-        """Register all available actions."""
-        from oko_test_harness.actions.cluster import (
-            SetupClusterAction,
-            InstallOperatorAction,
-            DeployClusterAction,
-            DeleteClusterAction,
-            CleanupClusterAction,
-            UpdateClusterAllocationSettingsAction,
-        )
-        from oko_test_harness.actions.data import (
-            IndexDocumentsAction,
-            QueryDocumentsAction,
-            CreateSnapshotAction,
-            RestoreSnapshotAction,
-        )
-        from oko_test_harness.actions.validation import (
-            ValidateClusterHealthAction,
-            ValidateDataIntegrityAction,
-            WaitForClusterReadyAction,
-            ValidateOperatorStatusAction,
-            ValidateClusterConfigurationAction,
-            ValidateNodeConfigurationAction,
-            ValidateCoordinatorNodesAction,
-            ValidateClusterVersionAction,
-        )
-        from oko_test_harness.actions.chaos import (
-            InjectPodFailureAction,
-            InjectNodeFailureAction,
-            InjectNetworkPartitionAction,
-            InjectResourcePressureAction,
-        )
-        from oko_test_harness.actions.upgrade import (
-            UpgradeClusterAction,
-            UpgradeOperatorAction,
-        )
-        from oko_test_harness.actions.scaling import (
-            ScaleClusterAction,
-            ScaleDownClusterAction,
-        )
-        from oko_test_harness.actions.monitoring import (
-            CollectLogsAction,
-            CaptureMetricsAction,
-            DebugPauseAction,
-        )
-
-        actions = [
-            SetupClusterAction,
-            InstallOperatorAction,
-            DeployClusterAction,
-            DeleteClusterAction,
-            CleanupClusterAction,
-            UpdateClusterAllocationSettingsAction,
-            IndexDocumentsAction,
-            QueryDocumentsAction,
-            CreateSnapshotAction,
-            RestoreSnapshotAction,
-            ValidateClusterHealthAction,
-            ValidateDataIntegrityAction,
-            WaitForClusterReadyAction,
-            ValidateOperatorStatusAction,
-            ValidateClusterConfigurationAction,
-            ValidateNodeConfigurationAction,
-            ValidateCoordinatorNodesAction,
-            ValidateClusterVersionAction,
-            InjectPodFailureAction,
-            InjectNodeFailureAction,
-            InjectNetworkPartitionAction,
-            InjectResourcePressureAction,
-            UpgradeClusterAction,
-            UpgradeOperatorAction,
-            ScaleClusterAction,
-            ScaleDownClusterAction,
-            CollectLogsAction,
-            CaptureMetricsAction,
-            DebugPauseAction,
-        ]
-
-        for action_class in actions:
-            self.actions[action_class.action_name] = action_class
-
-    def execute(
-        self, playbook: Playbook, variables: Dict[str, Any] = None
-    ) -> ExecutionContext:
-        """Execute a complete playbook."""
-        logger.debug(
-            f"Starting playbook execution: {playbook.metadata.name or 'unnamed'}"
-        )
-
-        context = ExecutionContext(
-            playbook=playbook,
-            variables=variables or {},
-            status=ExecutionStatus.RUNNING,
-            start_time=time.time(),
-        )
-
+    def execute(self, playbook: Playbook, variables=None) -> ExecutionContext:
+        ctx = ExecutionContext(playbook=playbook, variables=variables or {}, status=ExecutionStatus.RUNNING, start_time=time.time())
         try:
             for phase in playbook.phases:
-                logger.info(f"Executing phase: {phase.name}")
-                context.current_phase = phase.name
-
-                if not self._execute_phase(phase, context):
-                    context.status = ExecutionStatus.FAILED
+                ctx.current_phase = phase.name
+                logger.info(f"=== Phase: {phase.name}" + (f" - {phase.description}" if phase.description else ""))
+                if not self._execute_phase(phase, ctx):
+                    ctx.status = ExecutionStatus.FAILED
                     break
-
-            if context.status == ExecutionStatus.RUNNING:
-                context.status = ExecutionStatus.SUCCESS
-                logger.info("Playbook execution completed successfully")
-
-                # Perform automatic cleanup for successful runs
-                self._perform_automatic_cleanup(context)
-
-        except Exception as e:
-            logger.error(f"Playbook execution failed: {e}")
-            context.status = ExecutionStatus.FAILED
-
+            if ctx.status == ExecutionStatus.RUNNING:
+                ctx.status = ExecutionStatus.SUCCESS
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Playbook execution crashed")
+            ctx.status, ctx.failure = ExecutionStatus.FAILED, str(e)
         finally:
-            context.end_time = time.time()
-            context.current_phase = None
-            context.current_step = None
+            ctx.end_time = time.time()
+            self._teardown(ctx)
+        return ctx
 
-        return context
-
-    def _execute_phase(self, phase, context: ExecutionContext) -> bool:
-        """Execute a single phase."""
+    def _execute_phase(self, phase, ctx: ExecutionContext) -> bool:
+        background: List[Tuple[ActionStep, threading.Thread, list]] = []
+        ok = True
         for step in phase.steps:
-            context.current_step = step.action
-            logger.info(f"Executing step: {step.action}")
+            if step.background:
+                holder: list = []
+                t = threading.Thread(target=lambda s=step, h=holder: h.append(self._execute_step(s, ctx)), daemon=True)
+                t.start()
+                background.append((step, t, holder))
+                logger.info(f"Started background step: {step.action}")
+                continue
+            result = self._execute_step(step, ctx)
+            if not result.success:
+                if step.continue_on_error:
+                    logger.warning(f"Step '{step.action}' failed (continue_on_error): {result.message}")
+                    continue
+                ok = False
+                break
+        for step, t, holder in background:
+            t.join()
+            result = holder[0] if holder else ActionResult(False, "background step produced no result")
+            if not result.success and not step.continue_on_error:
+                logger.error(f"Background step '{step.action}' failed: {result.message}")
+                ok = False
+        return ok
 
-            if not self._execute_step(step, context):
-                logger.error(f"Step '{step.action}' failed in phase '{phase.name}'")
-                return False
-
-        return True
-
-    def _execute_step(self, step: ActionStep, context: ExecutionContext) -> bool:
-        """Execute a single step."""
+    def _execute_step(self, step: ActionStep, ctx: ExecutionContext) -> ActionResult:
+        logger.info(f"--- Step: {step.action} {step.params if step.params else ''}")
         action_class = self.actions.get(step.action)
         if not action_class:
-            logger.error(f"Unknown action: {step.action}")
-            return False
+            result = ActionResult(False, f"Unknown action: {step.action}. Known: {sorted(self.actions)}")
+        else:
+            result = self._run_with_backstop(action_class(ctx.playbook.config, ctx.variables), step, ctx)
+        key = f"{ctx.current_phase}.{step.action}"
+        n = 2
+        while key in ctx.results:
+            key, n = f"{ctx.current_phase}.{step.action}#{n}", n + 1
+        ctx.results[key] = result
+        if result.success:
+            logger.success(f"{step.action}: {result.message}")
+        else:
+            logger.error(f"{step.action} FAILED: {result.message}")
+            ctx.failure = ctx.failure or f"{key}: {result.message}"
+        return result
 
+    def _run_with_backstop(self, action: BaseAction, step: ActionStep, ctx: ExecutionContext) -> ActionResult:
+        """Foreground steps get a SIGALRM backstop (timeouts.step, or the step's own timeout + 5m): a step that
+        hangs past it is a bug somewhere and fails the playbook instead of running forever."""
+        limit = parse_duration(ctx.playbook.config.timeouts.step)
+        if "timeout" in step.params:
+            limit = min(limit, parse_duration(step.params["timeout"]) + 300)
+        if threading.current_thread() is not threading.main_thread():
+            return action.run(step.params)
+
+        def on_alarm(signum, frame):
+            raise TimeoutError(f"step {step.action} exceeded the {limit}s backstop")
+
+        old = signal.signal(signal.SIGALRM, on_alarm)
+        signal.alarm(limit)
         try:
-            action = action_class(context.playbook.config, context.variables)
-            result = action.execute(step.params)
+            return action.run(step.params)
+        except TimeoutError as e:
+            return ActionResult(False, str(e))
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
 
-            # Store result
-            step_id = f"{context.current_phase}.{step.action}"
-            context.results[step_id] = result
+    def _teardown(self, ctx: ExecutionContext) -> None:
+        cfg = ctx.playbook.config
+        failed = ctx.status != ExecutionStatus.SUCCESS
+        if failed:
+            self._run(ctx, "collect_logs", {"output_dir": f"./logs/{ctx.playbook.metadata.name}-{int(ctx.start_time)}"})
+        if failed and not cfg.kubernetes.cleanup_on_failure:
+            logger.info(f"Leaving namespace {cfg.opensearch.namespace} in place for inspection (cleanup_on_failure=false); k8s context {cfg.kubernetes.provider}/{cfg.kubernetes.cluster_name}")
+            return
+        # the namespace always goes on success; the k8s cluster itself only when cleanup_on_success is set
+        self._run(ctx, "delete_cluster", {"delete_namespace": True})
+        if cfg.kubernetes.provider != "existing" and (cfg.kubernetes.cleanup_on_success if not failed else cfg.kubernetes.cleanup_on_failure):
+            self._run(ctx, "cleanup_cluster", {})
 
-            if not result.success:
-                logger.error(f"Action '{step.action}' failed: {result.message}")
-                return False
-
-            logger.info(f"Action '{step.action}' completed successfully")
-            return True
-
-        except Exception as e:
-            logger.error(f"Error executing action '{step.action}': {e}")
-            context.results[f"{context.current_phase}.{step.action}"] = ActionResult(
-                success=False, message=str(e)
-            )
-            return False
-
-    def _perform_automatic_cleanup(self, context: ExecutionContext) -> None:
-        """Perform automatic cleanup after successful playbook execution."""
-        logger.info("Performing automatic cleanup after successful run")
-
+    def _run(self, ctx, action: str, params: Dict) -> None:
         try:
-            # Delete OpenSearch cluster
-            cluster_name = context.playbook.config.opensearch.cluster_name
-            namespace = context.playbook.config.opensearch.operator_namespace
-
-            logger.info(f"Cleaning up OpenSearch cluster: {cluster_name}")
-            delete_action = self.actions.get("delete_cluster")
-            if delete_action:
-                delete_result = delete_action(
-                    context.playbook.config, context.variables
-                ).execute(
-                    {
-                        "cluster_name": cluster_name,
-                        "namespace": namespace,
-                        "force": False,
-                        "wait_for_completion": True,
-                    }
-                )
-                if delete_result.success:
-                    logger.info("OpenSearch cluster cleanup completed")
-                else:
-                    logger.warning(
-                        f"OpenSearch cluster cleanup failed: {delete_result.message}"
-                    )
-
-            # Only cleanup the Kind cluster if cleanup_on_success is True
-            if context.playbook.config.kubernetes.cleanup_on_success:
-                logger.info("Cleaning up Kind cluster and Docker resources")
-                cleanup_action = self.actions.get("cleanup_cluster")
-                if cleanup_action:
-                    cleanup_result = cleanup_action(
-                        context.playbook.config, context.variables
-                    ).execute(
-                        {
-                            "cluster_name": context.playbook.config.kubernetes.cluster_name,
-                            "remove_cluster": True,
-                            "cleanup_docker": True,
-                        }
-                    )
-                    if cleanup_result.success:
-                        logger.info("Full cleanup completed successfully")
-                    else:
-                        logger.warning(f"Full cleanup failed: {cleanup_result.message}")
-            else:
-                logger.info("Skipping Kind cluster cleanup (cleanup_on_success=False)")
-
-        except Exception as e:
-            logger.error(f"Automatic cleanup failed: {e}")
-            # Don't fail the playbook execution just because cleanup failed
+            result = self.actions[action](ctx.playbook.config, ctx.variables).run(params)
+            (logger.info if result.success else logger.warning)(f"teardown {action}: {result.message}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"teardown {action} crashed: {e}")

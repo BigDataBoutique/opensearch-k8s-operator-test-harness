@@ -1,0 +1,57 @@
+metadata:
+  description: "Pod deletes, SIGKILLs, cluster-manager loss, operator restart and a Kubernetes node outage; the operator must bring the cluster back green with all data"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 5000, shards: 3, replicas: 1}
+
+  - name: pod_failures
+    steps:
+      - action: inject_pod_failure
+        params: {count: 1, method: delete}
+      - action: inject_pod_failure
+        params: {count: 1, method: kill}
+      - action: inject_pod_failure
+        params: {target: master, method: force_delete}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 5000}
+      - action: inject_pod_failure
+        params: {count: 2, method: force_delete, min_health: red}
+      - action: wait_for_cluster_ready
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 5000}
+
+  - name: operator_restart
+    steps:
+      - action: kill_operator
+      - action: index_documents
+        params: {index: data-b, count: 1000, replicas: 1}
+      - action: validate_operator_status
+
+  - name: node_outage
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 4m, min_success_ratio: 0.8}
+      - action: inject_node_failure
+        params: {duration: 2m, min_health: yellow}
+      - action: wait_for_cluster_ready
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 5000}
+      - action: validate_data_integrity
+        params: {index: data-b, expected_documents: 1000}
+      - action: validate_node_configuration
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

@@ -1,0 +1,51 @@
+metadata:
+  description: "diskSize change: the operator attempts an in-place PVC resize (STS deleted with orphaned pods, PVCs patched); on a storage class without allowVolumeExpansion (k3d local-path) it emits the PVC Warning, keeps the pods running, the cluster RUNNING and the data intact, and reverting the size settles cleanly"
+
+# With allowVolumeExpansion: true the same spec change must grow the PVCs; that path needs a different storage class.
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          disk_size: 4Gi
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 2000, shards: 3, replicas: 1}
+
+  - name: grow
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 100, replicas: 1, duration: 4m, min_success_ratio: 0.9}
+      - action: patch_cluster
+        params: {node_pool: {component: nodes, diskSize: 6Gi}}
+      - action: expect_event
+        params: {reason: PVC, type: Normal, contains: "Starting to resize PVC"}
+      - action: expect_event
+        params: {reason: PVC, type: Warning, contains: "Failed to Resize"}
+      - action: check_k8s_resource
+        params: {kind: statefulset, name: __CLUSTER__-nodes, expect: {status.readyReplicas: 3}}
+      - action: wait_for_cluster_ready
+      - action: check_k8s_resource
+        params: {kind: pvc, selector: "opensearch.org/opensearch-cluster=__CLUSTER__", min_count: 3, expect: {spec.resources.requests.storage: 4Gi}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+
+  - name: revert
+    steps:
+      - action: patch_cluster
+        params: {node_pool: {component: nodes, diskSize: 4Gi}, wait_running: true}
+      - action: wait_for_cluster_ready
+      - action: validate_node_configuration
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

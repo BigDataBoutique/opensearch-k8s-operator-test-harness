@@ -1,0 +1,45 @@
+metadata:
+  description: "general.drainDataNodes: true moves shards off a data node before it is restarted, so a rolling upgrade of dedicated data nodes keeps the cluster green with replicas: 1, and a scale-down drains the removed node with no document loss"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X_OLD:-3.0.0}"
+          drain_data_nodes: true
+          node_pools:
+            - {component: masters, replicas: 3, roles: ["cluster_manager"]}
+            - {component: data, replicas: 3, roles: ["data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 4000, shards: 3, replicas: 1}
+
+  - name: upgrade_with_drain
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 12m, min_success_ratio: 0.9}
+      - action: upgrade_cluster
+        params: {target_version: "${OS_VERSION_3X:-3.8.0}", max_unready_pods: 1, min_health: green}
+      - action: wait_for_cluster_ready
+        params: {expect_version: "${OS_VERSION_3X:-3.8.0}"}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 4000}
+
+  - name: scale_down_with_drain
+    steps:
+      - action: scale_cluster
+        params: {component: data, replicas: 2, min_health: green, max_unready_pods: 1}
+      - action: wait_for_cluster_ready
+      - action: validate_cluster_configuration
+        params: {total_nodes: 5, roles: {cluster_manager: 3, data: 2}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 4000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

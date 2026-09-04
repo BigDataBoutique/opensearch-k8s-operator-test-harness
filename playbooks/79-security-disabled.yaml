@@ -1,0 +1,45 @@
+metadata:
+  description: "security.tls.http.enabled: false disables the security plugin (documented switch): opensearch.yml gets plugins.security.disabled, no securityconfig job runs, the REST API answers plain HTTP without credentials, and data operations work"
+
+config:
+  opensearch:
+    security: {use_ssl: false}
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+          extra_spec:
+            security:
+              tls:
+                http: {enabled: false, generate: false}
+      - action: wait_for_cluster_ready
+
+  - name: verify
+    steps:
+      - action: check_pod_exec
+        params: {all_pods: true, command: "grep -E 'plugins.security' config/opensearch.yml", contains: ["plugins.security.disabled: true"]}
+      - action: check_k8s_resource
+        params: {kind: job, selector: "opensearch.org/opensearch-cluster=__CLUSTER__", exists: false}
+      - action: check_opensearch_api
+        params: {path: /_cluster/health, user: {username: nobody, password: nothing}, expect: {status: green}}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/authinfo, status: 400, absent: ["user_name"]}
+        continue_on_error: true
+      - action: validate_cluster_configuration
+        params: {total_nodes: 3}
+      - action: index_documents
+        params: {index: data-a, count: 1000, shards: 3, replicas: 1}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 1000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

@@ -1,0 +1,36 @@
+metadata:
+  description: "general.monitoring.enable installs the prometheus-exporter plugin on every node and serves /_prometheus/metrics; without the prometheus-operator CRDs the ServiceMonitor is skipped with a Warning event instead of failing the reconcile"
+
+# The shared k3d cluster has no monitoring.coreos.com CRDs; with them installed the ServiceMonitor <cluster>-monitor must exist instead.
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+          extra_spec:
+            general:
+              monitoring: {enable: true, scrapeInterval: 15s}
+      - action: wait_for_cluster_ready
+
+  - name: verify
+    steps:
+      - action: validate_cluster_configuration
+        params: {total_nodes: 3, plugins: ["prometheus-exporter"]}
+      - action: check_opensearch_api
+        params: {path: /_prometheus/metrics, contains: ["opensearch_cluster_status", "opensearch_cluster_nodes_number"]}
+      - action: expect_event
+        params: {reason: Monitoring, type: Warning, contains: "ServiceMonitor"}
+      - action: check_k8s_resource
+        params: {kind: servicemonitor, name: __CLUSTER__-monitor, exists: false}
+      - action: index_documents
+        params: {index: data-a, count: 500, replicas: 1}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

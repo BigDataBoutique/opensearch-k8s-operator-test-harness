@@ -1,0 +1,44 @@
+metadata:
+  description: "All pods of an emptyDir cluster force-deleted at once: the operator's EmptyDirRecovery detects the sustained data loss, recreates the cluster after its grace period, and ends RUNNING/green (data is gone by design)"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          drain_data_nodes: true
+          extra_spec:
+            nodePools:
+              - component: nodes
+                replicas: 3
+                roles: ["cluster_manager", "data", "ingest"]
+                diskSize: 5Gi
+                resources: {requests: {cpu: 250m, memory: 1Gi}, limits: {cpu: "2", memory: 2Gi}}
+                jvm: "-Xmx768m -Xms768m"
+                persistence: {emptyDir: {}}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 500, shards: 1, replicas: 1}
+
+  - name: total_loss
+    steps:
+      - action: inject_pod_failure
+        params: {count: 3, method: force_delete, wait: false}
+      - action: expect_event
+        params: {reason: EmptyDirRecovery, type: Warning, contains: "Recreating emptyDir cluster", timeout: 12m}
+      - action: wait_for_cluster_ready
+        params: {timeout: 15m}
+      - action: validate_cluster_configuration
+        params: {total_nodes: 3}
+      - action: index_documents
+        params: {index: data-b, count: 500, replicas: 1}
+      - action: validate_data_integrity
+        params: {index: data-b, expected_documents: 500}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

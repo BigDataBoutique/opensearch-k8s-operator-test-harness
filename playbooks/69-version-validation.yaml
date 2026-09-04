@@ -1,0 +1,62 @@
+metadata:
+  description: "A version change that skips a major (2.x -> 4.0.0) or downgrades is refused by the reconciler with a Warning/Upgrade event, the cluster and status.version stay untouched, the operator keeps reconciling, and a valid upgrade still works after reverting the spec"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_2X:-2.19.6}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 2000, shards: 3, replicas: 1}
+
+  - name: major_jump_refused
+    steps:
+      - action: patch_cluster
+        params: {patch: {spec: {general: {version: "4.0.0"}}}}
+      - action: expect_event
+        params: {reason: Upgrade, type: Warning, contains: "more than 1 major version"}
+      - action: validate_cluster_version
+        params: {expected_version: "${OS_VERSION_2X:-2.19.6}"}
+      - action: check_k8s_resource
+        params: {kind: pod, component: nodes, expect: {spec.containers.0.image: "docker.io/opensearchproject/opensearch:${OS_VERSION_2X:-2.19.6}"}}
+      - action: patch_cluster
+        params: {patch: {spec: {general: {version: "${OS_VERSION_2X:-2.19.6}"}}}, wait_running: true}
+      - action: wait_for_cluster_ready
+        params: {expect_version: "${OS_VERSION_2X:-2.19.6}"}
+
+  - name: downgrade_refused
+    steps:
+      - action: patch_cluster
+        params: {patch: {spec: {general: {version: "2.18.0"}}}}
+      - action: expect_event
+        params: {reason: Upgrade, type: Warning, contains: "is a downgrade"}
+      - action: validate_cluster_version
+        params: {expected_version: "${OS_VERSION_2X:-2.19.6}"}
+      - action: patch_cluster
+        params: {patch: {spec: {general: {version: "${OS_VERSION_2X:-2.19.6}"}}}, wait_running: true}
+      - action: wait_for_cluster_ready
+        params: {expect_version: "${OS_VERSION_2X:-2.19.6}"}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+
+  - name: operator_still_reconciles
+    steps:
+      - action: inject_pod_failure
+        params: {count: 1, method: delete}
+      - action: upgrade_cluster
+        params: {target_version: "${OS_VERSION_3X_OLD:-3.0.0}", max_unready_pods: 1}
+      - action: wait_for_cluster_ready
+        params: {expect_version: "${OS_VERSION_3X_OLD:-3.0.0}"}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

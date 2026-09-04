@@ -1,0 +1,113 @@
+metadata:
+  description: "Cluster-side state created through the REST API (index template, ISM policy + managed index, persistent cluster setting, internal user) survives an operator-driven rolling restart (nodePool additionalConfig change) and a rolling upgrade; the user still authenticates afterwards"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X_OLD:-3.0.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 2000, shards: 3, replicas: 1}
+
+  - name: create_state_via_rest
+    steps:
+      - action: check_opensearch_api
+        params:
+          path: /_index_template/oko-logs
+          method: PUT
+          body: {index_patterns: ["oko-logs-*"], priority: 100, template: {settings: {number_of_shards: 1, number_of_replicas: 1}, mappings: {properties: {level: {type: keyword}}}}}
+      - action: check_opensearch_api
+        params:
+          path: /_plugins/_ism/policies/oko-policy
+          method: PUT
+          status: 201
+          body:
+            policy:
+              description: "hot only"
+              default_state: hot
+              states: [{name: hot, actions: [{replica_count: {number_of_replicas: 1}}], transitions: []}]
+              ism_template: [{index_patterns: ["ism-*"], priority: 10}]
+      - action: check_opensearch_api
+        params: {path: /ism-2026, method: PUT, body: {settings: {number_of_shards: 1, number_of_replicas: 1}}}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_ism/explain/ism-2026, expect: {total_managed_indices: 1}, contains: ["oko-policy"]}
+      - action: check_opensearch_api
+        params: {path: /_cluster/settings, method: PUT, body: {persistent: {"cluster.max_shards_per_node": "1500"}}}
+      - action: check_opensearch_api
+        params:
+          path: /_plugins/_security/api/internalusers/oko-user
+          method: PUT
+          status: 201
+          body: {password: "OkoUser123!", backend_roles: ["admin"], attributes: {team: oko}}
+      - action: check_opensearch_api
+        params:
+          path: /_plugins/_security/authinfo
+          user: {username: oko-user, password: "OkoUser123!"}
+          expect: {user_name: oko-user, backend_roles: ["admin"]}
+
+  - name: rolling_restart
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 8m, min_success_ratio: 0.9}
+      - action: patch_cluster
+        params: {node_pool: {component: nodes, additionalConfig: {"http.max_content_length": "150mb"}}, expect_restart: true, wait_running: true}
+      - action: wait_for_cluster_ready
+      - action: check_pod_exec
+        params: {all_pods: true, command: "grep http.max_content_length config/opensearch.yml", contains: ["http.max_content_length: 150mb"]}
+      - action: check_opensearch_api
+        params: {path: /_index_template/oko-logs, expect: {index_templates: [{name: oko-logs, index_template: {index_patterns: ["oko-logs-*"], priority: 100}}]}}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_ism/policies/oko-policy, expect: {policy.default_state: hot, policy.ism_template: [{index_patterns: ["ism-*"]}]}}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_ism/explain/ism-2026, expect: {total_managed_indices: 1}, contains: ["oko-policy"]}
+      - action: check_opensearch_api
+        params: {path: /_cluster/settings, expect: {persistent.cluster.max_shards_per_node: "1500"}}
+      - action: check_opensearch_api
+        params:
+          path: /_plugins/_security/authinfo
+          user: {username: oko-user, password: "OkoUser123!"}
+          expect: {user_name: oko-user, backend_roles: ["admin"]}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/api/internalusers/oko-user, expect: {oko-user.attributes.team: oko}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+
+  - name: upgrade
+    steps:
+      - action: upgrade_cluster
+        params: {target_version: "${OS_VERSION_3X:-3.8.0}", max_unready_pods: 1}
+      - action: wait_for_cluster_ready
+        params: {expect_version: "${OS_VERSION_3X:-3.8.0}"}
+      - action: check_opensearch_api
+        params: {path: /_index_template/oko-logs, expect: {index_templates: [{name: oko-logs, index_template: {index_patterns: ["oko-logs-*"], priority: 100}}]}}
+      - action: check_opensearch_api
+        params: {path: /oko-logs-2026, method: PUT}
+      - action: check_opensearch_api
+        params: {path: /oko-logs-2026/_settings, expect: {"oko-logs-2026.settings.index.number_of_shards": "1"}}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_ism/policies/oko-policy, expect: {policy.default_state: hot}}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_ism/explain/ism-2026, expect: {total_managed_indices: 1}, contains: ["oko-policy"]}
+      - action: check_opensearch_api
+        params: {path: /_cluster/settings, expect: {persistent.cluster.max_shards_per_node: "1500"}}
+      - action: check_opensearch_api
+        params:
+          path: /_plugins/_security/authinfo
+          user: {username: oko-user, password: "OkoUser123!"}
+          expect: {user_name: oko-user, backend_roles: ["admin"]}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/authinfo, status: 401, user: {username: oko-user, password: "wrong"}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

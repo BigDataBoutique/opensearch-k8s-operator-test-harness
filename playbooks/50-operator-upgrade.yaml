@@ -1,0 +1,50 @@
+metadata:
+  description: "Cluster created by the previous released operator (opensearch.opster.io); upgrading the operator to the local build must leave the cluster untouched, migrate it to opensearch.org, and still upgrade OpenSearch afterwards"
+
+config:
+  opensearch:
+    api_group: "opensearch.opster.io"
+
+phases:
+  - name: setup_with_released_operator
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+        params: {version: "${OPERATOR_PREV:-2.8.4}"}
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_2X:-2.19.6}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 3000, shards: 3, replicas: 1}
+
+  - name: upgrade_operator
+    steps:
+      - action: upgrade_operator
+        params: {version: local}
+      - action: validate_operator_status
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 3000}
+
+  - name: migrated_api_group
+    steps:
+      - action: set_api_group
+        params: {api_group: opensearch.org}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-b, count: 1000, replicas: 1}
+      - action: upgrade_cluster
+        params: {target_version: "${OS_VERSION_3X_OLD:-3.0.0}", max_unready_pods: 1}
+      - action: wait_for_cluster_ready
+        params: {expect_version: "${OS_VERSION_3X_OLD:-3.0.0}"}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 3000}
+      - action: validate_data_integrity
+        params: {index: data-b, expected_documents: 1000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

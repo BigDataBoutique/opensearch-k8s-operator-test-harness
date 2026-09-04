@@ -1,0 +1,48 @@
+metadata:
+  description: "Rolling upgrade while indexing, with the operator killed and a pod deleted mid-upgrade; the upgrade must complete with no data loss"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X_OLD:-3.0.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 5000, shards: 3, replicas: 1}
+
+  - name: upgrade_with_chaos
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 12m, min_success_ratio: 0.9}
+      - action: kill_operator
+        background: true
+        params: {delay: 90s, wait: false}
+      - action: inject_pod_failure
+        background: true
+        params: {delay: 4m, count: 1, method: delete, wait: false}
+      - action: upgrade_cluster
+        params: {target_version: "${OS_VERSION_3X:-3.8.0}", max_unready_pods: 2, min_health: yellow}
+
+  - name: verify
+    steps:
+      - action: wait_for_cluster_ready
+        params: {expect_version: "${OS_VERSION_3X:-3.8.0}"}
+      - action: validate_cluster_version
+        params: {expected_version: "${OS_VERSION_3X:-3.8.0}"}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 5000}
+      - action: query_documents
+        params: {index: data-live, expected_min_count: 3000}
+      - action: validate_node_configuration
+      - action: validate_operator_status
+        params: {max_restarts: 0}
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

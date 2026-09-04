@@ -1,0 +1,117 @@
+# Running the harness (guide for Claude sessions and humans)
+
+Practical notes from running the suite end to end on a Linux dev box (28 CPU / 62 GB / k3d). Read this before
+starting a run; README.md explains the playbook format and actions.
+
+## 0. Environment checklist (2 minutes)
+
+```bash
+which k3d helm kubectl docker go make          # k3d + helm live in ~/.local/bin
+sysctl vm.max_map_count                        # must be >= 262144 (host kernel is shared with k3d nodes)
+df -h /                                        # < 85% used is comfortable; see "disk watermarks" below
+k3d cluster list; kubectl config current-context   # expect cluster `oko`, context `k3d-oko`
+kubectl get pods -n cert-manager -n opensearch-operator-system   # cert-manager + operator Running
+poetry install && poetry run pytest -q && poetry run oko-test validate
+```
+
+If the k3d cluster does not exist, `setup_cluster` creates it (1 server + 3 agents) and `install_operator`
+installs cert-manager and builds/installs the operator from `../opensearch-k8s-operator`. First operator build
+takes ~1.5 min; later runs reuse the image (tag = git sha + diff hash) and skip helm when the running image matches.
+
+## 1. How to run
+
+```bash
+# one playbook, verbose, log to file, in the background, exit code appended to the .out file
+pb=10-basic-3x
+nohup bash -c "poetry run oko-test -v --log-file logs/run-$pb.log run playbooks/$pb.yaml > logs/run-$pb.out 2>&1; echo exit=\$? >> logs/run-$pb.out" >/dev/null 2>&1 &
+
+# several playbooks sequentially in a "lane" (writes logs/lane-<name>.txt with rc + duration per playbook)
+nohup scripts/run-lane.sh A playbooks/12-coordinator-nodes.yaml playbooks/20-upgrade-minor-2x.yaml >/dev/null 2>&1 &
+```
+
+Concurrency: **at most 2 playbooks at a time** on a laptop-class box; the operator-upgrade playbook (`50-*`)
+must run **alone** (it replaces the shared operator). Every playbook uses its own random namespace and cluster
+name, and `install_operator` is idempotent, so lanes can share the k3d cluster and the operator.
+
+Typical durations when images are cached and IO is quiet: basic playbooks 2-3 min, upgrades 10-20 min,
+scaling ~15 min, chaos ~15 min. A step that runs longer than its timeout is almost always a real hang; the
+per-step backstop (`timeouts.step`, 40 m) fails the playbook instead of waiting forever.
+
+## 2. Monitors to arm (background, then keep working)
+
+Use the Monitor tool (or a background `until` loop) rather than polling. These three cover everything:
+
+1. **Per-playbook result** (one event when it ends):
+   ```bash
+   sleep 20; until grep -q "exit=" logs/run-<pb>.out; do sleep 15; done; grep -E "SUCCESS|FAILED|exit=|invariants" logs/run-<pb>.out | cut -c1-400
+   ```
+2. **Lane progress** (one event per finished playbook):
+   ```bash
+   n=0; while ! grep -q LANE_DONE logs/lane-A.txt; do c=$(wc -l < logs/lane-A.txt); [ "$c" -gt "$n" ] && tail -n +$((n+1)) logs/lane-A.txt; n=$c; sleep 20; done
+   ```
+3. **Stuck pods watch** (every 3 min; empty = healthy):
+   ```bash
+   while true; do kubectl get pods -A --no-headers | awk '$4=="Pending"||$4=="Terminating"||$4~/BackOff|Error|Unknown/{print $1"/"$2" "$4" "$6}' | tr '\n' ';'; echo; sleep 180; done
+   ```
+   Pods `Pending` for < 1 min right after `deploy_cluster` are normal. Anything Pending > 3 min, or
+   `helper-pod-create-pvc-*` in kube-system stuck `Terminating`, needs attention (section 4).
+
+**Killing runs safely.** `pkill -f <pattern>` kills your own shell if the shell's command line contains a match
+(this happened twice: patterns like `oko-test` also matched `kubectl get ns -l oko-test=true` in the same command).
+Run the kill in its *own* Bash call with nothing else in it:
+```bash
+pgrep -fa "run-lane" | grep -v pgrep | awk '{print $1}' | xargs -r kill
+pgrep -fa "bin/python" | grep -E "playbooks/[0-9]" | awk '{print $1}' | xargs -r kill
+```
+The harness process is `.venv/bin/python -c ...` under poetry; the playbook path is in its arguments.
+
+**Operator source changes mid-suite.** `install_operator` derives the image tag from the operator's git sha and
+diff, so if `../opensearch-k8s-operator` HEAD moves while lanes are running, the next playbook rebuilds and
+`helm upgrade`s the operator underneath every other running playbook (an unplanned operator restart mid-upgrade).
+Check `git -C ../opensearch-k8s-operator log -1 --oneline` before starting lanes and keep it stable during a suite.
+
+## 3. Reading results
+
+- `logs/run-<pb>.out`: INFO log + summary. `grep -E "SUCCESS|FAILED"` gives the step timeline.
+- `logs/run-<pb>.log`: DEBUG log, every kubectl call and every observer sample (`observer: {...}`).
+- On failure the executor writes `logs/<pb>-<ts>/` with the CR, pods, PVCs, events, operator log and every
+  OpenSearch pod log, and leaves the namespace in place (`cleanup_on_failure: false`).
+- `poetry run oko-test cleanup` deletes every namespace labelled `oko-test=true` (all harness leftovers).
+
+An operation step (upgrade/scale/chaos) reports `worst health`, `max unready pods` and document-count minimums
+observed *during* the operation; a violation there is the signal that matters for the operator.
+
+## 4. Things that went wrong and what they meant
+
+| Symptom | Cause | Action |
+|---|---|---|
+| Cluster stays **yellow**, replicas `UNASSIGNED` with reason `REPLICA_ADDED`, `_cluster/allocation/explain` says "above the low watermark 85%" | k3d volumes report the *host* disk usage; the host was 91% full | Harness sets watermarks 97/98/99% via `opensearch.default_cluster_settings` in `config.yaml` (goes into `additionalConfig`). Keep host disk < 85% if you can. |
+| PVCs `Pending` for minutes; kube-system `helper-pod-create-pvc-*` stuck `Terminating`; provisioner log "create process timeout after 120 seconds" | k3s local-path provisioner helper pod cannot be stopped by containerd under IO pressure (concurrent image imports / several clusters booting) | `k8s.unstick_local_path_helpers()` force-deletes helpers stuck > 2 min from inside wait loops. Manually: `kubectl delete pod -n kube-system <helper> --force --grace-period=0`. Avoid importing images while playbooks run. |
+| `wait_for_cluster_ready` failed with `RollingRestart InProgress` right after creation | Operator rolls pods once after bootstrap (initial cluster-manager setting removed), on multi-pool clusters this takes a few minutes | Expected. `wait_cluster_running` now waits for in-flight `RollingRestart`/`Scaler`/`Upgrader` statuses to clear. |
+| Dashboards pod never ready, log `no permissions ... User [name=kibanaserver]` | Harness ships a custom securityconfig; Dashboards default user is `kibanaserver`, which was not defined | Harness now adds the `kibanaserver` internal user, `kibana_server` role mapping, and `dashboards.opensearchCredentialsSecret`. (Whether the operator should validate this is tracked separately.) |
+| `helm upgrade --install failed: release name is invalid: /path/to/chart` | Argument order bug | Fixed; keep `helm upgrade --install <release> <chart> ...`. |
+| `k3d image import failed: Failed to run tools container` | Two playbooks importing at once | `install_operator` skips build/import when the operator already runs the wanted image and retries imports. |
+| IO pressure (`cat /proc/pressure/io` inside a node > 30% `full`) | Image imports + several clusters starting + plugin downloads; an unthrottled background indexer once wrote 2.3M docs in 8 min | Run ≤ 2 playbooks concurrently; pre-pull images *before* starting runs; background `index_documents` is throttled by `rate` (default 100 docs/s). |
+| `'Event' object is not callable` at the end of an observed step | Observer thread shadowed `threading.Thread._stop` | Fixed (`_stop_event`); covered by a unit test. |
+
+## 5. Version knobs
+
+Defaults come from Docker Hub as of 2026-09-04: `OS_VERSION_2X=2.19.6`, `OS_VERSION_2X_OLD=2.18.0`,
+`OS_VERSION_3X_OLD=3.0.0`, `OS_VERSION_3X=3.8.0`, `OPERATOR_PREV=2.8.4` (previous released chart, legacy
+`opensearch.opster.io` API). Dashboards images must exist for the same tag as OpenSearch (3.3.2 has none, 3.8.0 does).
+Check with:
+
+```bash
+curl -s 'https://hub.docker.com/v2/repositories/opensearchproject/opensearch/tags?page_size=100' | python3 -c "import json,sys; print(sorted(x['name'] for x in json.load(sys.stdin)['results']))"
+helm search repo opensearch-operator --versions | head
+```
+
+## 6. Suite order for a release gate
+
+1. `10-basic-3x`, `11-basic-2x`, `12-coordinator-nodes` (fast smoke, run first)
+2. Lane A: `20-upgrade-minor-2x`, `22-upgrade-minor-3x`, `30-scaling`
+3. Lane B: `21-upgrade-major-2x-to-3x`, `23-upgrade-abort`, `40-chaos`, `41-upgrade-under-chaos`
+4. `50-operator-upgrade` alone at the end (installs the previous released operator, then upgrades to the local build)
+
+Judge a failure by category: harness bug (fix and re-run), environment (section 4), or operator behaviour
+(collect `logs/<pb>-<ts>/`, the observer summary, and the CR status; that is the finding to report).

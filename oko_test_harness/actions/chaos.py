@@ -1,381 +1,144 @@
-"""Chaos engineering and failure injection actions."""
+"""Chaos actions. Each one breaks something, then waits for the operator to bring the cluster back
+and asserts no data was lost. `delay` lets a chaos step (run with background: true) strike in the
+middle of another step such as an upgrade."""
 
 import random
 import subprocess
 import time
-from typing import Any, Dict
 
-from oko_test_harness.actions.base import BaseAction
+from oko_test_harness import k8s
+from oko_test_harness.actions.base import BaseAction, parse_duration
+from oko_test_harness.actions.cluster import OPERATOR_SELECTOR, sh
 from oko_test_harness.models.playbook import ActionResult
-from oko_test_harness.utils.kubernetes import KubernetesManager
 
 
 class InjectPodFailureAction(BaseAction):
-    """Action to inject pod failures."""
+    """Delete or SIGKILL `count` OpenSearch pods (of a component, or the master), then wait for recovery."""
 
     action_name = "inject_pod_failure"
+    params = {"component", "count", "method", "delay", "target", "wait", "min_health", "indices"}
 
-    def execute(self, params: Dict[str, Any]) -> ActionResult:
-        params = self._merge_params(params)
-
-        target = params.get("target", "data-nodes")
-        count = params.get("count", 1)
+    def execute(self, params):
+        if params.get("delay"):
+            time.sleep(parse_duration(params["delay"]))
+        count = int(params.get("count", 1))
         method = params.get("method", "delete")
-        recovery_wait = params.get("recovery_wait", "2m")
-        namespace = params.get("namespace", self.config.opensearch.operator_namespace)
+        pods = self.pods(params.get("component"))
+        if params.get("target") == "master":
+            with self.os_client() as c:
+                master = c.get("/_cat/cluster_manager?format=json")[0]["node"]
+            pods = [p for p in pods if p["name"] == master]
+        if len(pods) < count:
+            return ActionResult(False, f"Only {len(pods)} candidate pods, need {count}")
+        victims = random.sample(pods, count)
+        obs = self.observer(params.get("indices"))
+        time.sleep(obs.interval)
+        for p in victims:
+            if method == "delete":
+                k8s.delete_pod(self.namespace, p["name"])
+            elif method == "force_delete":
+                k8s.delete_pod(self.namespace, p["name"], force=True)
+            elif method == "kill":
+                self._sigkill(p)
+            else:
+                obs.stop()
+                return ActionResult(False, f"Unknown method {method}; use delete, force_delete or kill")
+        names = [p["name"] for p in victims]
+        if not params.get("wait", True):
+            obs.stop()
+            return ActionResult(True, f"{method} {names}")
+        time.sleep(15)
+        self.wait_cluster_running(self.timeout(self.config.timeouts.recovery))
+        k8s.wait_for("health green", lambda: self._green(), self.timeout(self.config.timeouts.recovery), 10)
+        after = {p["name"]: p for p in self.pods()}
+        if method == "kill":
+            not_restarted = [p["name"] for p in victims if after.get(p["name"], {}).get("restarts", 0) <= p["restarts"]]
+            if not_restarted:
+                obs.stop()
+                return ActionResult(False, f"Containers in {not_restarted} did not restart after SIGKILL")
+        else:
+            not_recreated = [p["name"] for p in victims if after.get(p["name"], {}).get("uid") == p["uid"]]
+            if not_recreated:
+                obs.stop()
+                return ActionResult(False, f"Pods {not_recreated} were not recreated")
+        return self.finish_observed(obs, f"{method} {names}; cluster recovered", params.get("min_health", "red" if params.get("target") == "master" or count > 1 else "yellow"), max_unready_pods=count)
 
-        self.logger.info(f"Injecting pod failure: {method} {count} {target}")
+    def _green(self):
+        with self.os_client() as c:
+            h = c.health()
+        return h["status"] == "green" and not h["relocating_shards"]
 
-        try:
-            k8s_manager = KubernetesManager()
-            if not k8s_manager.load_config():
-                return ActionResult(False, "Failed to load Kubernetes config")
+    def _sigkill(self, pod):
+        """SIGKILL the OpenSearch java process. PID 1 ignores signals sent from inside its own pid namespace, so on
+        k3d/kind we resolve the container's host pid via crictl on the node and kill from there."""
+        ctx = k8s.current_context()
+        cid = k8s.kubectl("get", "pod", pod["name"], "-n", self.namespace, "-o", "jsonpath={.status.containerStatuses[?(@.name=='opensearch')].containerID}").split("//")[-1]
+        if cid and (ctx.startswith("k3d-") or ctx.startswith("kind-")):
+            pid = sh(["docker", "exec", pod["node"], "crictl", "inspect", "-o", "go-template", "--template", "{{.info.pid}}", cid]).strip()
+            sh(["docker", "exec", pod["node"], "kill", "-9", pid])
+            self.logger.info(f"SIGKILLed pid {pid} of {pod['name']} on node {pod['node']}")
+        else:
+            # best effort from inside: SIGSEGV is handled by the JVM and aborts it
+            r = k8s.exec_in_pod(self.namespace, pod["name"], "kill", "-SEGV", "1")
+            self.logger.info(f"kill -SEGV 1 in {pod['name']}: rc={r.returncode} {r.stderr.strip()[:200]}")
 
-            # Get target pods
-            label_selector = self._get_label_selector(target)
-            pods = k8s_manager.get_pods(namespace, label_selector)
 
-            if len(pods) < count:
-                return ActionResult(
-                    False,
-                    f"Not enough {target} pods found. Requested {count}, found {len(pods)}",
-                )
+class KillOperatorAction(BaseAction):
+    """Delete the operator pod (after `delay`) and verify it comes back and the cluster ends RUNNING."""
 
-            # Select random pods to target
-            target_pods = random.sample(pods, count)
+    action_name = "kill_operator"
+    params = {"delay", "wait"}
 
-            # Apply failure method
-            for pod in target_pods:
-                if method == "delete":
-                    self._delete_pod(pod["name"], namespace)
-                elif method == "kill":
-                    self._kill_pod_process(pod["name"], namespace)
-                else:
-                    return ActionResult(False, f"Unsupported failure method: {method}")
-
-            # Wait for recovery
-            recovery_seconds = self._parse_duration(recovery_wait)
-            time.sleep(recovery_seconds)
-
-            return ActionResult(
-                True, f"Injected {method} failure on {count} {target} pod(s)"
-            )
-
-        except Exception as e:
-            return ActionResult(False, f"Failed to inject pod failure: {e}")
-
-    def _get_label_selector(self, target: str) -> str:
-        """Get label selector for target type."""
-        selectors = {
-            "master-nodes": "opensearch.role/master=true",
-            "data-nodes": "opensearch.role/data=true",
-            "all-nodes": "app=opensearch",
-            "ingest-nodes": "opensearch.role/ingest=true",
-        }
-        return selectors.get(target, "app=opensearch")
-
-    def _delete_pod(self, pod_name: str, namespace: str) -> bool:
-        """Delete a pod."""
-        try:
-            result = subprocess.run(
-                ["kubectl", "delete", "pod", pod_name, "-n", namespace],
-                capture_output=True,
-                text=True,
-            )
-            return result.returncode == 0
-        except Exception as e:
-            self.logger.error(f"Failed to delete pod {pod_name}: {e}")
-            return False
-
-    def _kill_pod_process(self, pod_name: str, namespace: str) -> bool:
-        """Kill main process in pod."""
-        try:
-            result = subprocess.run(
-                [
-                    "kubectl",
-                    "exec",
-                    pod_name,
-                    "-n",
-                    namespace,
-                    "--",
-                    "pkill",
-                    "-f",
-                    "opensearch",
-                ],
-                capture_output=True,
-                text=True,
-            )
-            return result.returncode == 0
-        except Exception as e:
-            self.logger.error(f"Failed to kill process in pod {pod_name}: {e}")
-            return False
+    def execute(self, params):
+        if params.get("delay"):
+            time.sleep(parse_duration(params["delay"]))
+        ns = self.config.opensearch.operator_namespace
+        pods = k8s.get_pods(ns, OPERATOR_SELECTOR)
+        if not pods:
+            return ActionResult(False, "No operator pod found")
+        cr_phase = self.cr().get("status", {}).get("phase")
+        for p in pods:
+            k8s.delete_pod(ns, p["name"], force=True)
+        k8s.wait_for("operator pod back", lambda: [p for p in k8s.get_pods(ns, OPERATOR_SELECTOR) if p["ready"] and p["uid"] not in {q["uid"] for q in pods}], 300, 5)
+        if params.get("wait", True):
+            self.wait_cluster_running(self.timeout(self.config.timeouts.recovery))
+        return ActionResult(True, f"Killed operator pod(s) {[p['name'] for p in pods]} while cluster phase was {cr_phase}; operator back" + ("; cluster RUNNING" if params.get("wait", True) else ""))
 
 
 class InjectNodeFailureAction(BaseAction):
-    """Action to inject node failures."""
+    """Stop the Kubernetes node (k3d/kind docker container) hosting an OpenSearch pod for `duration`, then start it again
+    and wait for the operator and cluster to recover."""
 
     action_name = "inject_node_failure"
+    params = {"component", "duration", "delay", "min_health", "indices"}
 
-    def execute(self, params: Dict[str, Any]) -> ActionResult:
-        params = self._merge_params(params)
-
-        node_selector = params.get(
-            "node_selector", "node-role.kubernetes.io/worker=true"
-        )
-        count = params.get("count", 1)
-        method = params.get("method", "drain")
-
-        self.logger.info(f"Injecting node failure: {method} {count} node(s)")
-
+    def execute(self, params):
+        if params.get("delay"):
+            time.sleep(parse_duration(params["delay"]))
+        provider = self.config.kubernetes.provider
+        ctx = k8s.current_context()
+        if not (ctx.startswith("k3d-") or ctx.startswith("kind-")):
+            return ActionResult(False, f"Node failure needs a k3d or kind cluster (context {ctx}, provider {provider})")
+        victim = random.choice(self.pods(params.get("component")))
+        node = victim["node"]
+        duration = parse_duration(params.get("duration", "2m"))
+        obs = self.observer(params.get("indices"))
+        time.sleep(obs.interval)
+        self.logger.info(f"Stopping node {node} (hosts {victim['name']}) for {duration}s")
+        sh(["docker", "stop", node])
         try:
-            # Get nodes matching selector
-            result = subprocess.run(
-                [
-                    "kubectl",
-                    "get",
-                    "nodes",
-                    "-l",
-                    node_selector,
-                    "-o",
-                    "jsonpath={.items[*].metadata.name}",
-                ],
-                capture_output=True,
-                text=True,
-            )
+            time.sleep(duration)
+        finally:
+            sh(["docker", "start", node])
+        k8s.wait_for(f"node {node} Ready", lambda: "True" in k8s.kubectl("get", "node", node, "-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}"), 300, 5)
+        self.wait_cluster_running(self.timeout(self.config.timeouts.recovery))
+        k8s.wait_for("health green", lambda: self._green(), self.timeout(self.config.timeouts.recovery), 10)
+        return self.finish_observed(obs, f"Node {node} stopped {duration}s and restarted; cluster recovered", params.get("min_health", "yellow"), max_unready_pods=None)
 
-            if result.returncode != 0:
-                return ActionResult(False, f"Failed to get nodes: {result.stderr}")
-
-            nodes = result.stdout.strip().split()
-            if len(nodes) < count:
-                return ActionResult(
-                    False,
-                    f"Not enough nodes found. Requested {count}, found {len(nodes)}",
-                )
-
-            target_nodes = random.sample(nodes, count)
-
-            # Apply failure method
-            for node in target_nodes:
-                if method == "drain":
-                    self._drain_node(node)
-                elif method == "taint":
-                    self._taint_node(node)
-                else:
-                    return ActionResult(
-                        False, f"Unsupported node failure method: {method}"
-                    )
-
-            return ActionResult(
-                True, f"Applied {method} to {count} node(s): {', '.join(target_nodes)}"
-            )
-
-        except Exception as e:
-            return ActionResult(False, f"Failed to inject node failure: {e}")
-
-    def _drain_node(self, node_name: str) -> bool:
-        """Drain a node."""
-        try:
-            result = subprocess.run(
-                [
-                    "kubectl",
-                    "drain",
-                    node_name,
-                    "--ignore-daemonsets",
-                    "--delete-emptydir-data",
-                ],
-                capture_output=True,
-                text=True,
-            )
-            return result.returncode == 0
-        except Exception as e:
-            self.logger.error(f"Failed to drain node {node_name}: {e}")
-            return False
-
-    def _taint_node(self, node_name: str) -> bool:
-        """Taint a node."""
-        try:
-            result = subprocess.run(
-                ["kubectl", "taint", "node", node_name, "chaos=true:NoSchedule"],
-                capture_output=True,
-                text=True,
-            )
-            return result.returncode == 0
-        except Exception as e:
-            self.logger.error(f"Failed to taint node {node_name}: {e}")
-            return False
+    def _green(self):
+        with self.os_client() as c:
+            h = c.health()
+        return h["status"] == "green" and not h["relocating_shards"]
 
 
-class InjectNetworkPartitionAction(BaseAction):
-    """Action to inject network partitions."""
-
-    action_name = "inject_network_partition"
-
-    def execute(self, params: Dict[str, Any]) -> ActionResult:
-        params = self._merge_params(params)
-
-        target = params.get("target", "master-nodes")
-        duration = params.get("duration", "5m")
-        partition_type = params.get("partition_type", "isolate")
-        chaos_tool = params.get("chaos_tool", "chaos-mesh")
-
-        self.logger.info(
-            f"Injecting network partition: {partition_type} {target} for {duration}"
-        )
-
-        # This is a simplified implementation
-        # In reality, you'd use Chaos Mesh, Litmus, or similar tools
-
-        if chaos_tool == "chaos-mesh":
-            return self._inject_with_chaos_mesh(target, duration, partition_type)
-        else:
-            return ActionResult(False, f"Unsupported chaos tool: {chaos_tool}")
-
-    def _inject_with_chaos_mesh(
-        self, target: str, duration: str, partition_type: str
-    ) -> ActionResult:
-        """Inject network partition using Chaos Mesh."""
-        # This would require Chaos Mesh to be installed
-        # For now, we'll simulate with a simplified approach
-
-        chaos_manifest = f"""
-apiVersion: chaos-mesh.org/v1alpha1
-kind: NetworkChaos
-metadata:
-  name: network-partition-{int(time.time())}
-  namespace: opensearch
-spec:
-  action: partition
-  mode: fixed
-  duration: {duration}
-  selector:
-    labelSelectors:
-      app: opensearch
-      opensearch.role/master: "true"
-"""
-
-        try:
-            # Apply chaos manifest
-            import tempfile
-
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".yaml", delete=False
-            ) as f:
-                f.write(chaos_manifest)
-                temp_file = f.name
-
-            result = subprocess.run(
-                ["kubectl", "apply", "-f", temp_file], capture_output=True, text=True
-            )
-
-            if result.returncode == 0:
-                return ActionResult(True, f"Network partition injected for {duration}")
-            else:
-                return ActionResult(
-                    False, f"Failed to inject network partition: {result.stderr}"
-                )
-
-        except Exception as e:
-            return ActionResult(False, f"Failed to inject network partition: {e}")
-
-
-class InjectResourcePressureAction(BaseAction):
-    """Action to inject resource pressure."""
-
-    action_name = "inject_resource_pressure"
-
-    def execute(self, params: Dict[str, Any]) -> ActionResult:
-        params = self._merge_params(params)
-
-        target = params.get("target", "data-nodes")
-        resource = params.get("resource", "memory")
-        limit = params.get("limit", "80%")
-        duration = params.get("duration", "5m")
-        namespace = params.get("namespace", self.config.opensearch.operator_namespace)
-
-        self.logger.info(
-            f"Injecting {resource} pressure on {target} (limit: {limit}, duration: {duration})"
-        )
-
-        try:
-            # Get target pods
-            k8s_manager = KubernetesManager()
-            if not k8s_manager.load_config():
-                return ActionResult(False, "Failed to load Kubernetes config")
-
-            label_selector = self._get_label_selector(target)
-            pods = k8s_manager.get_pods(namespace, label_selector)
-
-            if not pods:
-                return ActionResult(False, f"No {target} pods found")
-
-            # Apply resource pressure to each pod
-            for pod in pods:
-                self._apply_resource_pressure(
-                    pod["name"], namespace, resource, limit, duration
-                )
-
-            return ActionResult(
-                True, f"Applied {resource} pressure to {len(pods)} {target} pod(s)"
-            )
-
-        except Exception as e:
-            return ActionResult(False, f"Failed to inject resource pressure: {e}")
-
-    def _get_label_selector(self, target: str) -> str:
-        """Get label selector for target type."""
-        selectors = {
-            "master-nodes": "opensearch.role/master=true",
-            "data-nodes": "opensearch.role/data=true",
-            "all-nodes": "app=opensearch",
-        }
-        return selectors.get(target, "app=opensearch")
-
-    def _apply_resource_pressure(
-        self, pod_name: str, namespace: str, resource: str, limit: str, duration: str
-    ) -> bool:
-        """Apply resource pressure to a pod."""
-        try:
-            if resource == "memory":
-                # Use stress-ng or similar tool to consume memory
-                cmd = [
-                    "kubectl",
-                    "exec",
-                    pod_name,
-                    "-n",
-                    namespace,
-                    "--",
-                    "stress-ng",
-                    "--vm",
-                    "1",
-                    "--vm-bytes",
-                    limit,
-                    "--timeout",
-                    duration,
-                ]
-            elif resource == "cpu":
-                # Use stress-ng to consume CPU
-                cmd = [
-                    "kubectl",
-                    "exec",
-                    pod_name,
-                    "-n",
-                    namespace,
-                    "--",
-                    "stress-ng",
-                    "--cpu",
-                    "2",
-                    "--timeout",
-                    duration,
-                ]
-            else:
-                self.logger.warning(f"Unsupported resource type: {resource}")
-                return False
-
-            # Run in background
-            subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            return True
-
-        except Exception as e:
-            self.logger.error(f"Failed to apply resource pressure to {pod_name}: {e}")
-            return False
+__all__ = ["subprocess"]

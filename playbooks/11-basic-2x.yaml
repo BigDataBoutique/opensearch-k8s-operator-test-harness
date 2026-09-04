@@ -1,0 +1,38 @@
+metadata:
+  description: "OpenSearch 2.19.x with dedicated cluster managers and data nodes (security config with 'master' role name)"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_2X:-2.19.6}"
+          node_pools:
+            - component: masters
+              replicas: 3
+              roles: ["cluster_manager"]
+            - component: data
+              replicas: 2
+              roles: ["data", "ingest"]
+      - action: wait_for_cluster_ready
+
+  - name: validate
+    steps:
+      - action: validate_cluster_version
+        params: {expected_version: "${OS_VERSION_2X:-2.19.6}"}
+      - action: validate_cluster_configuration
+        params:
+          total_nodes: 5
+          roles: {cluster_manager: 3, data: 2, ingest: 2}
+      - action: validate_node_configuration
+      - action: index_documents
+        params: {index: data-a, count: 3000, shards: 2, replicas: 1}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 3000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

@@ -1,0 +1,50 @@
+metadata:
+  description: "Dashboards with additionalConfig and 2 replicas: the config reaches opensearch_dashboards.yml, and a dashboards.version change is a rolling update of the Deployment with no pod unavailable"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          dashboards: {enabled: true, replicas: 2, version: "${OS_VERSION_3X_OLD:-3.0.0}"}
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+          extra_spec:
+            dashboards:
+              additionalConfig: {"opensearch.ignoreVersionMismatch": "true", "opensearch.requestTimeout": "60000"}
+      - action: wait_for_cluster_ready
+      - action: validate_dashboards
+        params: {replicas: 2}
+
+  - name: verify
+    steps:
+      - action: check_k8s_resource
+        params:
+          kind: deployment
+          name: __CLUSTER__-dashboards
+          expect: {spec.replicas: 2, spec.strategy.type: RollingUpdate, spec.template.spec.containers.0.image: "docker.io/opensearchproject/opensearch-dashboards:${OS_VERSION_3X_OLD:-3.0.0}"}
+      - action: check_pod_exec
+        params:
+          selector: "opensearch.cluster.dashboards=__CLUSTER__"
+          container: dashboards
+          all_pods: true
+          command: "cat config/opensearch_dashboards.yml"
+          contains: ["opensearch.requestTimeout: 60000", "opensearch.ignoreVersionMismatch: true"]
+
+  - name: version_change
+    steps:
+      - action: patch_cluster
+        params: {patch: {spec: {dashboards: {version: "${OS_VERSION_3X:-3.8.0}"}}}}
+      - action: wait_dashboards_version
+        params: {version: "${OS_VERSION_3X:-3.8.0}", max_unavailable: 0}
+      - action: validate_dashboards
+        params: {replicas: 2}
+      - action: wait_for_cluster_ready
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

@@ -1,0 +1,63 @@
+metadata:
+  description: "The OpenSearchCluster validating webhook denies invalid CRs with clear messages (duplicate/empty node pool names, TLS without generate or secret, custom HTTP cert without adminSecret, storage class change, legacy opensearch.opster.io/v1 creation) and leaves the live cluster untouched"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+
+  - name: cluster_create_rules
+    steps:
+      - action: expect_rejected
+        params:
+          cluster_params: {node_pools: [{component: nodes, replicas: 1}, {component: nodes, replicas: 1, roles: ["data"]}]}
+          message: "duplicate node pool component name 'nodes'"
+      - action: expect_rejected
+        params:
+          cluster_params: {node_pools: [{component: "", replicas: 1}]}
+          message: "has an empty component name"
+      - action: expect_rejected
+        params:
+          cluster_params: {extra_spec: {security: {tls: {transport: {generate: false, perNode: false}}}}}
+          message: "transport TLS is enabled but neither generate nor secret is provided"
+      - action: expect_rejected
+        params:
+          cluster_params: {extra_spec: {security: {tls: {http: {generate: false}}}}}
+          message: "HTTP TLS is enabled but neither generate nor secret is provided"
+      - action: expect_rejected
+        params:
+          cluster_params: {extra_spec: {security: {tls: {http: {generate: false, secret: {name: some-http-cert}}}}}}
+          message: "admin secret name is not provided but http.tls generate is not true"
+
+  - name: cluster_update_rules
+    steps:
+      - action: expect_rejected
+        params:
+          node_pool: {component: nodes, persistence: {pvc: {storageClass: some-other-class, accessModes: [ReadWriteOnce]}}}
+          message: "storage class cannot be changed for node pool 'nodes'"
+      - action: expect_rejected
+        params:
+          patch: {spec: {nodePools: [{component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"], diskSize: 5Gi}, {component: nodes, replicas: 1, roles: ["data"], diskSize: 5Gi}]}}
+          message: "duplicate node pool component name 'nodes'"
+      - action: validate_cluster_configuration
+        params: {total_nodes: 3}
+
+  - name: legacy_api_group
+    steps:
+      - action: expect_rejected
+        params:
+          api_version: opensearch.opster.io/v1
+          cluster_params: {node_pools: [{component: nodes, replicas: 1}]}
+          message: "Creation of old API group OpenSearchCluster resources is not allowed"
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster
