@@ -60,7 +60,8 @@ Use the Monitor tool (or a background `until` loop) rather than polling. These t
 (this happened twice: patterns like `oko-test` also matched `kubectl get ns -l oko-test=true` in the same command).
 Run the kill in its *own* Bash call with nothing else in it:
 ```bash
-pgrep -fa "run-lane" | grep -v pgrep | awk '{print $1}' | xargs -r kill
+pgrep -fa "scripts/run-lane.sh" | grep -v pgrep | awk '{print $1}' | xargs -r kill   # always match the script path: a bare "chain" once matched the desktop's pipewire filter-chain
+pgrep -fa "scripts/chain" | grep -v pgrep | awk '{print $1}' | xargs -r kill
 pgrep -fa "bin/python" | grep -E "playbooks/[0-9]" | awk '{print $1}' | xargs -r kill
 ```
 The harness process is `.venv/bin/python -c ...` under poetry; the playbook path is in its arguments.
@@ -98,12 +99,14 @@ observed *during* the operation; a violation there is the signal that matters fo
 | Cluster yellow for 15+ min after two pods were force-killed at once; `_cat/recovery` shows peer recoveries at stage `init`, 0%, no log errors | OpenSearch peer recovery hung on the *source* node (the manager whose java was SIGKILLed in place) | Restart the source node, not the target (target restart re-hangs). Cluster went green in ~1 min with all data. Not an operator issue (FINDINGS N9); `40-chaos` runs this as a non-blocking last phase. |
 | `check_opensearch_api` reports "condition not met" for an expected 4xx | `wait_for` predicate returned a `requests.Response`, which is falsy for non-2xx | Fixed: predicates must return a truthy container, never a bare Response. |
 | `apply_resource` fails with `namespaces "oko-xxxxx" not found` | Resource applied before `deploy_cluster` created the namespace | Fixed: `apply_resource` ensures the namespace. |
+| Operator pod `CreateContainerError` / `ContainerCreating` for minutes on `k3d-oko-server-0`; `cat /proc/pressure/io` in that node > 50% | k3s schedules workloads on the server node too; under IO saturation its containerd misses deadlines, and a node-outage test there takes the API server down | `kubectl cordon k3d-oko-server-0` and recreate the pod. New clusters get `--node-taint=CriticalAddonsOnly=true:NoExecute@server:*` from `setup_cluster`; `inject_node_failure` never picks control-plane nodes. |
+| Host disk shrinking during a long suite (43 -> 32 GB free in ~2 h) | Docker build cache from operator rebuilds (+6 GB) and image churn in the k3d node stores caused by kubelet image GC above 85% | Keep the operator source stable during a suite (each HEAD change rebuilds and re-imports), prune `docker builder` cache between suites, keep the host below 85%. |
 | A fresh 1-manager cluster never forms; CR says RUNNING; node log `an election requires a node with id [...]` = the bootstrap pod | Operator issue #1448 (bootstrap removed without voting-config exclusion) | Use 3 managers in playbooks that are not about quorum (FINDINGS N10). |
 
 ## 5. Version knobs
 
 Defaults come from Docker Hub as of 2026-09-04: `OS_VERSION_2X=2.19.6`, `OS_VERSION_2X_OLD=2.18.0`,
-`OS_VERSION_3X_OLD=3.0.0`, `OS_VERSION_3X=3.8.0`, `OPERATOR_PREV=2.8.4` (previous released chart, legacy
+`OS_VERSION_3X_OLD=3.0.0`, `OS_VERSION_3X=3.8.0`, `OPERATOR_PREV=2.8.0` (last published chart that works as a 2.x operator: 2.8.1 and 2.8.2 pass webhook flags the 2.8.0 binary rejects, 2.8.3 and 2.8.4 ship 3.0.0-alpha; legacy
 `opensearch.opster.io` API). Dashboards images must exist for the same tag as OpenSearch (3.3.2 has none, 3.8.0 does).
 Check with:
 
@@ -113,6 +116,8 @@ helm search repo opensearch-operator --versions | head
 ```
 
 ## 6. Suite order for a release gate
+
+`nohup scripts/run-suite.sh >/dev/null 2>&1 &` runs everything below in one go (10 alone to build the operator image, two lanes, then 50 alone); results land in `logs/lane-S0..S3.txt`. Arm one monitor on those files (section 2). Manually:
 
 1. `10-basic-3x`, `11-basic-2x`, `12-coordinator-nodes` (fast smoke, run first)
 2. Lane A: `20-upgrade-minor-2x`, `22-upgrade-minor-3x`, `30-scaling`

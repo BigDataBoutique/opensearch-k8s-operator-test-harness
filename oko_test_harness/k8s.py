@@ -74,14 +74,19 @@ def replace_cr(cr: Dict[str, Any]) -> None:
     apply(json.dumps(cr))
 
 
+LEGACY_LABEL_PREFIX = "opster.io/"  # operator <= 2.8 labels pods opster.io/opensearch-cluster|nodepool; 3.x uses opensearch.org/
+
+
 def get_pods(namespace: str, label_selector: Optional[str] = None) -> List[Dict[str, Any]]:
-    args = ["pods", "-n", namespace]
-    if label_selector:
-        args += ["-l", label_selector]
-    items = get_json(*args).get("items", [])
+    """Pods as dicts; a selector on the 3.x labels falls back to the 2.x labels and legacy labels are mirrored onto the 3.x keys."""
+    items = get_json("pods", "-n", namespace, *(["-l", label_selector] if label_selector else [])).get("items", [])
+    if not items and label_selector and "opensearch.org/" in label_selector:
+        items = get_json("pods", "-n", namespace, "-l", label_selector.replace("opensearch.org/", LEGACY_LABEL_PREFIX)).get("items", [])
     pods = []
     for p in items:
         statuses = (p.get("status") or {}).get("containerStatuses") or []
+        labels = p["metadata"].get("labels") or {}
+        labels = {**{k.replace(LEGACY_LABEL_PREFIX, "opensearch.org/", 1): v for k, v in labels.items() if k.startswith(LEGACY_LABEL_PREFIX)}, **labels}
         pods.append(
             {
                 "name": p["metadata"]["name"],
@@ -93,7 +98,7 @@ def get_pods(namespace: str, label_selector: Optional[str] = None) -> List[Dict[
                 "uid": p["metadata"]["uid"],
                 "image": p["spec"]["containers"][0]["image"],
                 "node": p["spec"].get("nodeName"),
-                "labels": p["metadata"].get("labels") or {},
+                "labels": labels,
                 "containers": p["spec"]["containers"],
                 "deletion": bool(p["metadata"].get("deletionTimestamp")),
             }

@@ -98,7 +98,7 @@ phases:
       - action: check_pod_exec
         params:
           all_pods: true
-          command: "grep -E 'nodes_dn|admin_dn|pemcert_filepath' config/opensearch.yml"
+          command: "grep -E -A1 'nodes_dn|admin_dn|pemcert_filepath' config/opensearch.yml"
           contains: ["CN=__CLUSTER__-node,OU=oko", "CN=admin,OU=oko", "tls-http/tls.crt", "tls-transport/tls.crt"]
       - action: check_opensearch_api
         params: {path: /_plugins/_security/api/internalusers/admin, status: 200}

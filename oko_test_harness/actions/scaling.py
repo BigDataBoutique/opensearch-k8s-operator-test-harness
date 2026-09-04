@@ -2,6 +2,7 @@
 read-modify-write of the CR (a merge patch would replace the whole nodePools array)."""
 
 import time
+from typing import Optional
 
 from oko_test_harness import k8s
 from oko_test_harness.actions.base import BaseAction
@@ -9,7 +10,7 @@ from oko_test_harness.models.playbook import ActionResult
 
 
 class _ScaleBase(BaseAction):
-    def apply_and_wait(self, cr, obs, message: str, expected_nodes: int, params, removed: int = 0):
+    def apply_and_wait(self, cr, obs, message: str, expected_nodes: int, params, removed: int = 0, step_drop: Optional[int] = 1):
         k8s.replace_cr(cr)
         self.wait_cluster_running(self.timeout(self.config.timeouts.scaling))
 
@@ -25,7 +26,7 @@ class _ScaleBase(BaseAction):
         k8s.wait_for("cluster settled", settled, self.timeout(self.config.timeouts.scaling), 10)
         # scale-ups: new pods are unready while they start, so judge by cluster members lost instead of unready pods;
         # scale-downs may lose exactly `removed` members overall but only one between consecutive samples
-        return self.finish_observed(obs, message, params.get("min_health", "yellow"), params.get("max_unready_pods"), max_nodes_down=params.get("max_nodes_down", max(1, removed)), max_step_drop=1)
+        return self.finish_observed(obs, message, params.get("min_health", "yellow"), params.get("max_unready_pods"), max_nodes_down=params.get("max_nodes_down", max(1, removed)), max_step_drop=step_drop)
 
 
 class ScaleClusterAction(_ScaleBase):
@@ -96,6 +97,8 @@ class RemoveNodePoolAction(_ScaleBase):
         time.sleep(obs.interval)
         cr["spec"]["nodePools"] = [p for p in pools if p is not pool]
         expected = sum(p["replicas"] for p in cr["spec"]["nodePools"])
+        # a removed pool's StatefulSet is deleted as a whole, so all its members leave at once (no one-at-a-time drain)
         return self.apply_and_wait(
-            cr, obs, f"Removed node pool {pool['component']} ({pool['replicas']} nodes)", expected, {**params, "max_unready_pods": params.get("max_unready_pods", pool["replicas"])}
+            cr, obs, f"Removed node pool {pool['component']} ({pool['replicas']} nodes)", expected,
+            {**params, "max_unready_pods": params.get("max_unready_pods", pool["replicas"])}, removed=pool["replicas"], step_drop=None,
         )

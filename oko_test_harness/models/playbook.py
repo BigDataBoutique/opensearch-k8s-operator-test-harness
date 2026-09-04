@@ -57,6 +57,7 @@ class OpenSearchConfig:
     disk_size: str = "5Gi"
     # applied to every deployed cluster via general.additionalConfig; playbook cluster_settings are merged on top
     default_cluster_settings: Dict[str, Any] = field(default_factory=dict)
+    operator_restart_baseline: Optional[int] = None  # set by install_operator; validate_operator_status counts restarts since then
 
 
 @dataclass

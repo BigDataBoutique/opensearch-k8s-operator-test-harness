@@ -1,9 +1,5 @@
 metadata:
-  description: "Cluster created by the previous released operator (opensearch.opster.io); upgrading the operator to the local build must leave the cluster untouched, migrate it to opensearch.org, and still upgrade OpenSearch afterwards"
-
-# BLOCKED on the current operator build at migrated_api_group.set_api_group: the legacy CR stores dashboards.replicas: 0
-# (the 2.x CRD requires the field) and the 3.x migration controller's update is denied by the legacy webhook (FINDINGS-round3 N25).
-# 51-operator-upgrade-migrated runs the same flow with replicas: 1 to exercise the migration and post-migration steps.
+  description: "Same as 50-operator-upgrade but the legacy cluster stores dashboards.replicas: 1 (dashboards still disabled), which sidesteps FINDINGS-round3 N25 so the migration to opensearch.org and the post-migration OpenSearch upgrade are exercised"
 
 config:
   opensearch:
@@ -20,6 +16,7 @@ phases:
       - action: deploy_cluster
         params:
           version: "${OS_VERSION_2X:-2.19.6}"
+          dashboards: {enabled: false, replicas: 1}  # see description
           node_pools:
             - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
       - action: wait_for_cluster_ready
@@ -30,7 +27,10 @@ phases:
   - name: upgrade_operator
     steps:
       - action: upgrade_operator
-        params: {version: local}
+        # the 3.x reconciler recreates the StatefulSet (new label selector), creates a transient bootstrap pod, re-runs the
+        # securityconfig job and rolling-restarts every node once it adopts the migrated CR (FINDINGS-round3 N26); the
+        # observer still enforces one node out at a time, health >= yellow and no document loss
+        params: {version: local, expect_restart: true}
       - action: validate_operator_status
       - action: validate_data_integrity
         params: {index: data-a, expected_documents: 3000}

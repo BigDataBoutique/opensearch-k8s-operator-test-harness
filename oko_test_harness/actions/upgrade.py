@@ -5,7 +5,7 @@ import time
 
 from oko_test_harness import k8s
 from oko_test_harness.actions.base import BaseAction
-from oko_test_harness.actions.cluster import OPERATOR_SELECTOR, InstallOperatorAction
+from oko_test_harness.actions.cluster import operator_pods, InstallOperatorAction
 from oko_test_harness.models.playbook import ActionResult
 
 
@@ -72,7 +72,7 @@ class UpgradeOperatorAction(BaseAction):
             obs.stop()
             return result
         # the migration controller / new operator may take a moment to adopt the cluster
-        k8s.wait_for("new operator pod ready", lambda: all(p["ready"] for p in k8s.get_pods(self.config.opensearch.operator_namespace, OPERATOR_SELECTOR)), 300, 5)
+        k8s.wait_for("new operator pod ready", lambda: all(p["ready"] for p in operator_pods(self.config.opensearch.operator_namespace)), 300, 5)
         self.wait_cluster_running(self.timeout(self.config.timeouts.recovery))
         time.sleep(60)  # let a couple of reconcile loops run with the new operator before judging
         self.wait_cluster_running(self.timeout(self.config.timeouts.recovery))

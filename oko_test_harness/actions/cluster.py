@@ -6,7 +6,7 @@ import json
 import os
 import subprocess
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import bcrypt
 from loguru import logger
@@ -16,6 +16,18 @@ from oko_test_harness.actions.base import BaseAction
 from oko_test_harness.models.playbook import ActionResult
 
 OPERATOR_SELECTOR = "app.kubernetes.io/name=opensearch-operator"
+LEGACY_OPERATOR_SELECTOR = "control-plane=controller-manager"  # charts <= 2.8.x label the pod this way only
+
+
+def operator_pods(ns: str):
+    """Operator pods for the current (3.x) chart labels, falling back to the 2.x chart labels."""
+    return k8s.get_pods(ns, OPERATOR_SELECTOR) or k8s.get_pods(ns, LEGACY_OPERATOR_SELECTOR)
+
+
+def operator_deployment(release: str, ns: str) -> str:
+    """'opensearch-operator' (3.x chart) or 'opensearch-operator-controller-manager' (2.x chart)."""
+    names = k8s.kubectl("get", "deploy", "-n", ns, "-o", "jsonpath={.items[*].metadata.name}").split()
+    return next((n for n in names if n == release), None) or next((n for n in names if n.startswith(release)), release)
 
 
 def sh(cmd: List[str], timeout: int = 1800, cwd=None) -> str:
@@ -48,6 +60,8 @@ class SetupClusterAction(BaseAction):
             # continuously garbage-collect pre-pulled images and can evict OpenSearch pods; relax them for a test cluster
             for arg in ("image-gc-high-threshold=97", "image-gc-low-threshold=95", "eviction-hard=nodefs.available<2%,imagefs.available<2%"):
                 cmd += ["--k3s-arg", f"--kubelet-arg={arg}@agent:*", "--k3s-arg", f"--kubelet-arg={arg}@server:*"]
+            # keep workloads off the control plane: a saturated server node made containerd miss deadlines and took the API server down with it
+            cmd += ["--k3s-arg", "--node-taint=CriticalAddonsOnly=true:NoExecute@server:*"]
             if version:
                 cmd += ["--image", f"rancher/k3s:{version}-k3s1"]
             sh(cmd)
@@ -78,17 +92,23 @@ class InstallOperatorAction(BaseAction):
         ns = o.operator_namespace
         if params.get("cert_manager", True):
             ensure_cert_manager()
-        common = ["-n", ns, "--create-namespace", "--wait", "--timeout", self.p.get("timeout", "10m")]
+        # --reset-values: helm reuses the previous release's user values when none are given, which kept the local dev image on a "released" chart
+        common = ["-n", ns, "--create-namespace", "--reset-values", "--wait", "--timeout", self.p.get("timeout", "10m")]
+        image = None
         if version == "local":
             go_dir, chart = operator_dirs(o.local_operator_path)
             image = local_operator_image(go_dir)
-            running = [p for p in k8s.get_pods(ns, OPERATOR_SELECTOR) if p["ready"]]
-            if running and all(p["image"] == image for p in running) and not params.get("values") and not params.get("values_file") and "legacy_api" not in params:
+            running = [p for p in operator_pods(ns) if p["ready"]]
+            # the image alone is not proof: a released chart installed by 50-operator-upgrade can still run the dev image
+            same_chart = installed_chart(o.operator_release, ns) == local_chart_name_version(chart)
+            if running and same_chart and all(p["image"] == image for p in running) and not params.get("values") and not params.get("values_file") and "legacy_api" not in params:
                 # kubelet image GC on a full host removes unused-looking images; re-import so a restarted operator pod can start
                 import_image_into_cluster(image)
+                o.operator_restart_baseline = sum(p["restarts"] for p in running)
                 return ActionResult(True, f"Operator already running {image} in {ns}", {"image": image})
             build_local_operator(go_dir, image)
             repo, tag = image.rsplit(":", 1)
+            common.remove("--wait")  # the rollout is watched below so a GC'd image can be re-imported instead of timing out
             cmd = [
                 "helm",
                 "upgrade",
@@ -106,6 +126,16 @@ class InstallOperatorAction(BaseAction):
         else:
             sh(["helm", "repo", "add", "opensearch-operator", o.helm_repo_url, "--force-update"])
             sh(["helm", "repo", "update", "opensearch-operator"])
+            if installed_chart(o.operator_release, ns):
+                # uninstall deletes the CRDs; a leftover CR with the operator's finalizer would deadlock that (operator gone first)
+                leftovers = [f"{i['metadata']['namespace']}/{i['metadata']['name']}" for g in ("opensearch.org", "opensearch.opster.io") for i in (k8s.get_json(k8s.cluster_resource(g), "-A") or {}).get("items", [])]
+                if leftovers:
+                    raise RuntimeError(f"cannot replace the operator while OpenSearchCluster objects exist: {leftovers}; this playbook must run alone")
+                # a released chart is the *starting point* of an upgrade scenario, so it is installed from scratch: helm's
+                # three-way merge from a different (or failed) release leaves resources such as the renamed Deployment untouched.
+                # Note: the operator chart templates its CRDs, so this deletes every OpenSearchCluster in the k8s cluster (N23).
+                logger.warning(f"Uninstalling existing release {o.operator_release} before installing chart {version}")
+                sh(["helm", "uninstall", o.operator_release, "-n", ns, "--wait", "--timeout", "5m"])
             cmd = ["helm", "upgrade", "--install", o.operator_release, "opensearch-operator/opensearch-operator", "--version", version, *common]
         if "legacy_api" in params:
             cmd += ["--set", f"legacyAPI.enabled={'true' if params['legacy_api'] else 'false'}"]
@@ -123,10 +153,29 @@ class InstallOperatorAction(BaseAction):
                     time.sleep(20)
                     continue
                 raise
-        k8s.kubectl("rollout", "status", f"deployment/{o.operator_release}", "-n", ns, "--timeout=5m")
+        wait_operator_rollout(o.operator_release, ns, image)
         k8s.kubectl("wait", "--for=condition=established", "--timeout=60s", f"crd/{self.cr_resource()}")
-        pods = k8s.get_pods(ns, OPERATOR_SELECTOR)
+        pods = operator_pods(ns)
+        o.operator_restart_baseline = sum(p["restarts"] for p in pods if p["ready"])
         return ActionResult(True, f"Operator {version} installed in {ns} ({[p['image'] for p in pods]})", {"image": pods[0]["image"] if pods else None})
+
+
+def wait_operator_rollout(release: str, ns: str, local_image: Optional[str], timeout: int = 600) -> None:
+    """kubectl rollout status, but a locally imported image that kubelet image GC removed meanwhile is re-imported and the pod recreated."""
+    deadline = time.time() + timeout
+    while True:
+        try:
+            k8s.kubectl("rollout", "status", f"deployment/{operator_deployment(release, ns)}", "-n", ns, "--timeout=30s")
+            return
+        except k8s.KubectlError as e:
+            if time.time() > deadline:
+                raise RuntimeError(f"operator rollout did not complete within {timeout}s: {e}") from e
+        stuck = [p for p in operator_pods(ns) if p["image"] == local_image and p.get("waiting_reason") in ("ErrImagePull", "ImagePullBackOff")]
+        if stuck and local_image:
+            logger.warning(f"Operator pod(s) {[p['name'] for p in stuck]} cannot pull {local_image} (kubelet image GC?); re-importing")
+            import_image_into_cluster(local_image)
+            for p in stuck:
+                k8s.delete_pod(ns, p["name"])
 
 
 def ensure_cert_manager() -> None:
@@ -149,6 +198,22 @@ def operator_dirs(local_path: str):
         if not os.path.isdir(d):
             raise RuntimeError(f"operator directory not found: {d}")
     return go_dir, chart
+
+
+def installed_chart(release: str, ns: str) -> Optional[str]:
+    """'opensearch-operator-3.0.10' for the deployed helm release, None when not installed."""
+    out = subprocess.run(["helm", "list", "-n", ns, "-o", "json"], capture_output=True, text=True).stdout
+    return next((r.get("chart") for r in (json.loads(out) if out.strip() else []) if r.get("name") == release), None)
+
+
+def local_chart_name_version(chart_dir: str) -> str:
+    meta = {}
+    with open(os.path.join(chart_dir, "Chart.yaml")) as f:
+        for line in f:
+            if ":" in line and not line.startswith(" "):
+                k, v = line.split(":", 1)
+                meta[k.strip()] = v.strip().strip("\"'")
+    return f"{meta.get('name')}-{meta.get('version')}"
 
 
 def local_operator_image(go_dir: str) -> str:
@@ -197,6 +262,8 @@ class DeployClusterAction(BaseAction):
 
     def execute(self, params):
         o = self.config.opensearch
+        # __CLUSTER__ / __NAMESPACE__ placeholders (cluster names are random per run) anywhere in the params
+        params = json.loads(json.dumps(params).replace("__CLUSTER__", self.cluster).replace("__NAMESPACE__", self.namespace))
         k8s.ensure_namespace(self.namespace)
         create_security_secrets(self.namespace, o.security.username, o.security.password)
         manifest = params.get("manifest") or json.dumps(self.build_cr(params))
@@ -221,7 +288,7 @@ class DeployClusterAction(BaseAction):
                 "config": {"securityConfigSecret": {"name": "securityconfig-secret"}, "adminCredentialsSecret": {"name": "admin-credentials-secret"}},
                 "tls": {"transport": {"generate": True, "perNode": True}, "http": {"generate": True}},
             },
-            "dashboards": {"enable": False, "version": version, "replicas": 0},
+            "dashboards": {"enable": False, "version": version, "replicas": 0},  # the 2.x CRD requires version+replicas; a stored 0 blocks migration (FINDINGS-round3 N25)
             "nodePools": [],
         }
         if params.get("plugins"):
@@ -229,6 +296,8 @@ class DeployClusterAction(BaseAction):
         dash = params.get("dashboards") or {}
         if dash.get("enabled"):
             spec["dashboards"] = {"enable": True, "version": dash.get("version", version), "replicas": int(dash.get("replicas", 1)), "opensearchCredentialsSecret": {"name": "dashboards-credentials"}}
+        elif "replicas" in dash:  # disabled dashboards with an explicit replica count (51-* sidesteps N25 with 1)
+            spec["dashboards"]["replicas"] = int(dash["replicas"])
         storage_class = params.get("storage_class", o.storage_class)
         for pool in pools:
             p = {
@@ -297,7 +366,7 @@ class DeleteClusterAction(BaseAction):
         if pvcs and params.get("expect_pvcs_deleted"):
             return ActionResult(False, f"PVCs still present after cluster deletion: {pvcs}")
         for pvc in pvcs:
-            k8s.kubectl("delete", "pvc", pvc, "-n", self.namespace, "--wait=false")
+            k8s.kubectl("delete", "pvc", pvc, "-n", self.namespace, "--ignore-not-found", "--wait=false")
         if params.get("delete_namespace"):
             k8s.kubectl("delete", "ns", self.namespace, "--ignore-not-found", "--wait=false")
         return ActionResult(True, f"Deleted OpenSearchCluster {self.namespace}/{self.cluster}" + (f", removed PVCs {pvcs}" if pvcs else ""))

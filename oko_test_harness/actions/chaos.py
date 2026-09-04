@@ -8,7 +8,7 @@ import time
 
 from oko_test_harness import k8s
 from oko_test_harness.actions.base import BaseAction, parse_duration
-from oko_test_harness.actions.cluster import OPERATOR_SELECTOR, sh
+from oko_test_harness.actions.cluster import operator_pods, sh
 from oko_test_harness.models.playbook import ActionResult
 
 
@@ -93,7 +93,7 @@ class KillOperatorAction(BaseAction):
         if params.get("delay"):
             time.sleep(parse_duration(params["delay"]))
         ns = self.config.opensearch.operator_namespace
-        pods = k8s.get_pods(ns, OPERATOR_SELECTOR)
+        pods = operator_pods(ns)
         if not pods:
             return ActionResult(False, "No operator pod found")
         cr_phase = self.cr().get("status", {}).get("phase")
@@ -103,7 +103,7 @@ class KillOperatorAction(BaseAction):
             import_image_into_cluster(pods[0]["image"])  # kubelet image GC may have dropped it; the new pod must be able to start
         for p in pods:
             k8s.delete_pod(ns, p["name"], force=True)
-        k8s.wait_for("operator pod back", lambda: [p for p in k8s.get_pods(ns, OPERATOR_SELECTOR) if p["ready"] and p["uid"] not in {q["uid"] for q in pods}], 300, 5)
+        k8s.wait_for("operator pod back", lambda: [p for p in operator_pods(ns) if p["ready"] and p["uid"] not in {q["uid"] for q in pods}], 300, 5)
         if params.get("wait", True):
             self.wait_cluster_running(self.timeout(self.config.timeouts.recovery))
         return ActionResult(True, f"Killed operator pod(s) {[p['name'] for p in pods]} while cluster phase was {cr_phase}; operator back" + ("; cluster RUNNING" if params.get("wait", True) else ""))
@@ -123,7 +123,14 @@ class InjectNodeFailureAction(BaseAction):
         ctx = k8s.current_context()
         if not (ctx.startswith("k3d-") or ctx.startswith("kind-")):
             return ActionResult(False, f"Node failure needs a k3d or kind cluster (context {ctx}, provider {provider})")
-        victim = random.choice(self.pods(params.get("component")))
+        control_plane = {n["metadata"]["name"] for n in k8s.get_json("nodes").get("items", []) if any(k.startswith("node-role.kubernetes.io/control-plane") or k.startswith("node-role.kubernetes.io/master") for k in (n["metadata"].get("labels") or {}))}
+        candidates = [p for p in self.pods(params.get("component")) if p["node"] and p["node"] not in control_plane]
+        if not candidates:
+            return ActionResult(False, f"No OpenSearch pod runs on a worker node (control plane: {sorted(control_plane)}); stopping the control plane would only test the API server")
+        # stopping the node that hosts the operator restarts the operator too, which validate_operator_status would then count as a crash
+        operator_nodes = {p["node"] for p in operator_pods(self.config.opensearch.operator_namespace)}
+        candidates = [p for p in candidates if p["node"] not in operator_nodes] or candidates
+        victim = random.choice(candidates)
         node = victim["node"]
         duration = parse_duration(params.get("duration", "2m"))
         obs = self.observer(params.get("indices"))

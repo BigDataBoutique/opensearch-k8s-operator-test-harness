@@ -7,7 +7,7 @@ import time
 
 from oko_test_harness import k8s
 from oko_test_harness.actions.base import BaseAction
-from oko_test_harness.actions.cluster import OPERATOR_SELECTOR
+from oko_test_harness.actions.cluster import operator_pods
 from oko_test_harness.models.playbook import ActionResult
 
 
@@ -31,7 +31,7 @@ class CollectLogsAction(BaseAction):
             "operator-events.txt": ["get", "events", "-n", ons, "--sort-by=.lastTimestamp"],
             "nodes.txt": ["get", "nodes", "-o", "wide"],
         }
-        for p in k8s.get_pods(ons, OPERATOR_SELECTOR):
+        for p in operator_pods(ons):
             dumps[f"operator-{p['name']}.log"] = ["logs", p["name"], "-n", ons, f"--since={since}"]
             if p["restarts"]:
                 dumps[f"operator-{p['name']}-previous.log"] = ["logs", p["name"], "-n", ons, "--previous"]

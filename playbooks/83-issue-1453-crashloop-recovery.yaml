@@ -20,7 +20,7 @@ phases:
       - action: patch_cluster
         params: {patch: {spec: {general: {additionalConfig: {"oko.invalid.setting": "true"}}}}}
       - action: expect_event
-        params: {reason: RollingRestart, type: Warning, contains: "CrashLoopBackOff", timeout: 10m}
+        params: {reason: RollingRestart, type: Warning, contains: "CrashLoopBackOff", timeout: 30m}  # OpenSearch takes minutes to die on a bad setting, so the CrashLoopBackOff window the operator polls for appears late
       - action: check_opensearch_api
         params: {path: /_cluster/health, expect: {number_of_nodes: 2}}
       - action: validate_data_integrity

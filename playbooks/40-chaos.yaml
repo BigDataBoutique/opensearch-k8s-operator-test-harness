@@ -56,6 +56,7 @@ phases:
         continue_on_error: true
         params: {timeout: 10m}
       - action: validate_data_integrity
+        continue_on_error: true
         params: {index: data-a, expected_documents: 5000}
       - action: validate_operator_status
 

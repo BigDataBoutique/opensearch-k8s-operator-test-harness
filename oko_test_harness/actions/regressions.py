@@ -216,7 +216,8 @@ class RollingRestartAction(BaseAction):
             k8s.kubectl("patch", self.cr_resource(), self.cluster, "-n", self.namespace, "--type", "merge", "-p", json.dumps(params["patch"]))
         if params.get("node_pool"):
             cr, np = self.cr(), dict(params["node_pool"])
-            pool = next((p for p in cr["spec"]["nodePools"] if p["component"] == np.pop("component")), None)
+            comp = np.pop("component")  # pop outside the generator: popping inside raises KeyError on the second pool
+            pool = next((p for p in cr["spec"]["nodePools"] if p["component"] == comp), None)
             if pool is None:
                 obs.stop()
                 return ActionResult(False, f"No node pool {params['node_pool'].get('component')}")
@@ -296,6 +297,7 @@ class EditNodePoolsAction(_ScaleBase):
     def execute(self, params):
         cr = self.cr()
         removed = set(params.get("remove") or [])
+        removed_replicas = sum(p["replicas"] for p in cr["spec"]["nodePools"] if p["component"] in removed)
         pools = [p for p in cr["spec"]["nodePools"] if p["component"] not in removed]
         for up in params.get("update") or []:
             pool = next((p for p in pools if p["component"] == up["component"]), None)
@@ -313,7 +315,9 @@ class EditNodePoolsAction(_ScaleBase):
             return ActionResult(True, msg + " (not waiting)")
         obs = self.observer(params.get("indices"))
         time.sleep(obs.interval)
-        return self.apply_and_wait(cr, obs, msg, sum(p["replicas"] for p in pools), params)
+        # removed pools go away as a whole and may overlap with a rolling restart of updated pools (see findings N19):
+        # judge by health, document counts and total members lost, not by per-sample drops
+        return self.apply_and_wait(cr, obs, msg, sum(p["replicas"] for p in pools), params, removed=removed_replicas, step_drop=None)
 
 
 class PausePodsAction(BaseAction):

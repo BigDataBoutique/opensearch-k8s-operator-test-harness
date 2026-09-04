@@ -396,10 +396,17 @@ class WaitDashboardsVersionAction(BaseAction):
         name, version = f"{self.cluster}-dashboards", str(params["version"])
         worst = 0
         deadline = time.time() + self.timeout("10m")
+        missing_since = None
+        st = image = None
         while time.time() < deadline:
             d = k8s.get_json("deployment", name, "-n", self.namespace)
-            if not d:
-                return ActionResult(False, f"deployment {name} not found")
+            if not d:  # a transient API/kubectl failure reads as empty; only fail if it stays missing for a minute
+                missing_since = missing_since or time.time()
+                if time.time() - missing_since > 60:
+                    return ActionResult(False, f"deployment {name} not found for 60s")
+                time.sleep(3)
+                continue
+            missing_since = None
             st, want = d.get("status", {}), d["spec"].get("replicas", 1)
             worst = max(worst, want - st.get("availableReplicas", 0))
             image = d["spec"]["template"]["spec"]["containers"][0]["image"]

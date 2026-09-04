@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 
 from oko_test_harness import k8s
 from oko_test_harness.actions.base import BaseAction
-from oko_test_harness.actions.cluster import OPERATOR_SELECTOR
+from oko_test_harness.actions.cluster import operator_pods
 from oko_test_harness.models.playbook import ActionResult
 from oko_test_harness.opensearch import health_at_least
 
@@ -200,13 +200,16 @@ class ValidateOperatorStatusAction(BaseAction):
 
     def execute(self, params):
         ns = self.config.opensearch.operator_namespace
-        pods = k8s.get_pods(ns, OPERATOR_SELECTOR)
+        pods = operator_pods(ns)
         if not pods:
-            return ActionResult(False, f"No operator pods in {ns} matching {OPERATOR_SELECTOR}")
+            return ActionResult(False, f"No operator pods in {ns}")
         bad = [p for p in pods if p["phase"] != "Running" or not p["ready"] or p["crash_loop"]]
         if bad:
             return ActionResult(False, f"Operator pods unhealthy: {[(p['name'], p['phase'], p['ready']) for p in bad]}")
         restarts = sum(p["restarts"] for p in pods)
+        baseline = self.config.opensearch.operator_restart_baseline
+        if baseline is not None and len(pods) == 1:
+            restarts = max(0, restarts - baseline)  # restarts during this playbook only (a new pod resets the count anyway)
         if restarts > int(params.get("max_restarts", 0)):
             logs = k8s.kubectl("logs", "-n", ns, pods[0]["name"], "--previous", "--tail=50", check=False)
             return ActionResult(False, f"Operator restarted {restarts} times. Last crash logs:\n{logs[-3000:]}")
@@ -224,7 +227,7 @@ class ValidateOperatorStatusAction(BaseAction):
             panics.append(line[:300])
         if panics:
             return ActionResult(False, f"Operator log contains panics for {self.namespace}: {panics[:3]}")
-        return ActionResult(True, f"Operator {pods[0]['image']} running, {restarts} restarts, no panics in log")
+        return ActionResult(True, f"Operator {pods[0]['image']} running, {restarts} restarts during this run, no panics in log")
 
 
 class ValidateDashboardsAction(BaseAction):

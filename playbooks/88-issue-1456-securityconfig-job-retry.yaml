@@ -25,12 +25,11 @@ phases:
           data:
             roles.yml: "_meta:\n  type: roles\n  config_version: 2\nbroken_role:\n  cluster_permissions: not-a-list\n  index_permissions: nope\n"
       - action: expect_event
-        params: {reason: Security, type: Warning, contains: "Securityconfig update job failed, retrying", timeout: 20m}
+        params: {reason: Security, type: Warning, contains: "Securityconfig update job failed, retrying", timeout: 50m}  # the job retries internally until activeDeadlineSeconds (40m) before the operator sees it as Failed
+      # Securityconfig: Failed (with retry:N / lastRetry conditions) lasts only until the retry job is active
+      # (30 s initial backoff), after which the status reads Running again; assert the retry job instead.
       - action: check_k8s_resource
-        params:
-          kind: opensearchclusters.opensearch.org
-          name: __CLUSTER__
-          expect: {status.componentsStatus: [{component: Securityconfig, status: Failed}]}
+        params: {kind: job, name: __CLUSTER__-securityconfig-update, expect: {status.active: 1}, timeout: 5m}
       - action: check_opensearch_api
         params: {path: /_cluster/health, expect: {status: green}}
       - action: validate_data_integrity
