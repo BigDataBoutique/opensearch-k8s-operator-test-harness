@@ -1,0 +1,47 @@
+metadata:
+  description: "PR #1476 (merged): renaming a data pool (old pool removed and new pool added in one apply) while a rolling restart runs concurrently (jvm change on the managers in the same apply) must not livelock. The restart reconciler's stale-exclusion cleanup must leave the drain's exclude._name entry alone, so the old pool drains one node at a time to completion: never more than one node missing at once, health >= yellow, no document loss under live indexing, old StatefulSet and pods gone, exclude._name cleared. Unfixed operators cleared the exclusion on every reconcile, shards flowed back and the drain never converged (this step times out after 20m)."
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          extra_spec: {confMgmt: {smartScaler: true}}
+          node_pools:
+            - {component: masters, replicas: 3, roles: ["cluster_manager"]}
+            - {component: data, replicas: 3, roles: ["data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 3000, shards: 3, replicas: 1}
+
+  - name: rename_pool_during_rolling_restart
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 12m, min_success_ratio: 0.9}
+      - action: edit_node_pools
+        params:
+          remove: [data]
+          add: [{component: data-v2, replicas: 3, roles: ["data", "ingest"]}]
+          update: [{component: masters, jvm: "-Xmx700m -Xms700m"}]
+          max_nodes_down: 1
+          min_health: yellow
+          timeout: 20m
+      - action: wait_for_cluster_ready
+      - action: check_k8s_resource
+        params: {kind: statefulset, name: __CLUSTER__-data, exists: false}
+      - action: check_k8s_resource
+        params: {kind: pod, component: data, exists: false}
+      - action: validate_cluster_configuration
+        params: {total_nodes: 6, roles: {cluster_manager: 3, data: 3}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 3000}
+      - action: validate_node_configuration
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

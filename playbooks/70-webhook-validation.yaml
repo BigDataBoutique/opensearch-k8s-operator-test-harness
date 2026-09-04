@@ -25,12 +25,25 @@ phases:
           message: "has an empty component name"
       - action: expect_rejected
         params:
+          cluster_params: {extra_spec: {security: {tls: {transport: {enabled: true, generate: false, perNode: false}}}}}
+          message: "transport TLS is enabled but neither generate nor secret is provided"
+      # Same CR without the explicit `enabled: true`: transport TLS is on by default, but the webhook only checks the
+      # explicit case (webhook/opensearch_cluster_webhook.go validateTlsConfig), so this is accepted and the cluster can never start.
+      # Kept as a deliberate failing check (FINDINGS-new.md N7); continue_on_error so the remaining rules still run.
+      - action: expect_rejected
+        continue_on_error: true
+        params:
           cluster_params: {extra_spec: {security: {tls: {transport: {generate: false, perNode: false}}}}}
           message: "transport TLS is enabled but neither generate nor secret is provided"
       - action: expect_rejected
         params:
-          cluster_params: {extra_spec: {security: {tls: {http: {generate: false}}}}}
+          cluster_params: {extra_spec: {security: {tls: {http: {enabled: true, generate: false}}}}}
           message: "HTTP TLS is enabled but neither generate nor secret is provided"
+      # unset `enabled` skips the HTTP rule (same gap as transport, N7); the admin-secret rule catches this case instead
+      - action: expect_rejected
+        params:
+          cluster_params: {extra_spec: {security: {tls: {http: {generate: false}}}}}
+          message: "admin secret name is not provided but http.tls generate is not true"
       - action: expect_rejected
         params:
           cluster_params: {extra_spec: {security: {tls: {http: {generate: false, secret: {name: some-http-cert}}}}}}

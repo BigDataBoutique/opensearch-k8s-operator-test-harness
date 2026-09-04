@@ -8,6 +8,8 @@ phases:
       - action: install_operator
       - action: deploy_cluster
         params:
+          # smartScaler makes scale-down exclude + drain the node first; without it the operator removes nodes undrained
+          extra_spec: {confMgmt: {smartScaler: true}}
           node_pools:
             - {component: masters, replicas: 3, roles: ["cluster_manager"]}
             - {component: data, replicas: 2, roles: ["data", "ingest"]}

@@ -1,0 +1,39 @@
+metadata:
+  description: "Issue #1448 (open), bootstrap variant: on a fresh 3-manager cluster the operator removes the bootstrap pod without excluding it from the voting configuration first; the elected manager pod is deleted the moment the bootstrap pod goes away. The cluster must re-elect and stay available (API never unreachable for more than 90s, never red, RUNNING/green again, voting configuration = the three managers, nothing excluded), and a later cluster-manager loss must be survived the same way. Three managers usually survive this (auto-reconfiguration keeps a majority); a failure here is the real quorum loss described in #1448."
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+
+  - name: manager_loss_right_after_bootstrap
+    steps:
+      - action: delete_pod_after_bootstrap
+        params: {component: nodes, max_unreachable: 90s, min_health: yellow}
+      - action: wait_for_cluster_ready
+      - action: check_voting_config
+        params: {component: nodes}
+      - action: validate_cluster_configuration
+        params: {total_nodes: 3, roles: {cluster_manager: 3, data: 3}}
+      - action: index_documents
+        params: {index: data-a, count: 1000, shards: 3, replicas: 1}
+
+  - name: manager_loss_on_a_settled_cluster
+    steps:
+      - action: inject_pod_failure
+        params: {target: master, method: force_delete}
+      - action: check_voting_config
+        params: {component: nodes}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 1000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

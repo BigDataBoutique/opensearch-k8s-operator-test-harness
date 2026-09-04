@@ -46,9 +46,10 @@ phases:
         params:
           version: "${OS_VERSION_3X:-3.8.0}"
           node_pools:
-            - {component: solo, replicas: 1, roles: ["cluster_manager", "data", "ingest"]}
+            # 3 managers: a 1-manager cluster never forms on the current operator (FINDINGS-new.md N10 / issue #1448,
+            # covered by playbooks 81-82); this phase is about namespace deletion, not quorum
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
       - action: wait_for_cluster_ready
-        params: {health: yellow}
       - action: delete_namespace
         params: {timeout: 10m}
       - action: validate_operator_status

@@ -1,0 +1,56 @@
+metadata:
+  description: "Issues #1450, #1471 and #1369 (fixed): after a data scale-down has left a Scaler entry first in status.componentsStatus, a config-change rolling restart of every pool (drainDataNodes false, so allocation is set to primaries before each pod delete) must restart pods strictly one at a time (the quorum guard must never disrupt two managers), keep health >= yellow, lose no documents under live indexing, and re-enable shard allocation when done (cluster.routing.allocation.enable back to all, exclude._name empty, RollingRestart status Finished). A jvm change on the managers must then roll only the manager pool. Unfixed operators returned the wrong componentsStatus entry from findStatus and left allocation.enable=primaries behind (cluster yellow for hours, later drains stuck)."
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          extra_spec: {confMgmt: {smartScaler: true}}
+          node_pools:
+            - {component: masters, replicas: 3, roles: ["cluster_manager"]}
+            - {component: data, replicas: 3, roles: ["data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 3000, shards: 3, replicas: 1}
+
+  - name: scale_down_first
+    steps:
+      - action: scale_cluster
+        params: {component: data, replicas: 2, min_health: yellow, max_unready_pods: 1}
+      - action: wait_for_cluster_ready
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 3000}
+
+  - name: restart_every_pool
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 12m, min_success_ratio: 0.9}
+      - action: rolling_restart
+        params: {patch: {spec: {general: {additionalConfig: {"http.max_content_length": "150mb"}}}}, max_unready_pods: 1, min_health: yellow, timeout: 20m}
+      - action: wait_for_cluster_ready
+      - action: check_k8s_resource
+        params:
+          kind: opensearchclusters.opensearch.org
+          name: __CLUSTER__
+          expect: {status.componentsStatus: [{component: RollingRestart, status: Finished}]}
+      - action: check_pod_exec
+        params: {all_pods: true, command: "grep http.max_content_length config/opensearch.yml", contains: ["http.max_content_length: 150mb"]}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 3000}
+
+  - name: restart_managers_only
+    steps:
+      - action: rolling_restart
+        params: {node_pool: {component: masters, jvm: "-Xmx700m -Xms700m"}, expect_pools: [masters], max_unready_pods: 1, min_health: yellow}
+      - action: wait_for_cluster_ready
+      - action: validate_node_configuration
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

@@ -1,0 +1,34 @@
+metadata:
+  description: "Issue #1449 (open): a rolling restart must complete on a cluster with a single cluster-manager-eligible node (the common one-node dev topology). An additionalConfig change must replace the only pod, the new setting must be in opensearch.yml and the data must still be there. EXPECTED TO FAIL while #1449 is unfixed: the quorum guard treats 1 <= (1+1)/2 as unsafe, logs 'No safe non-master candidates, requeuing to wait for quorum' every 10s and never restarts the pod (rolling_restart times out after 10m)."
+# Single node: the index uses replicas 0 so the cluster can be green (a replica could never be assigned here).
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          node_pools:
+            - {component: nodes, replicas: 1, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: check_voting_config
+        params: {component: nodes}
+      - action: index_documents
+        params: {index: data-a, count: 1000, shards: 1, replicas: 0}
+
+  - name: config_change_restart
+    steps:
+      - action: rolling_restart
+        params: {patch: {spec: {general: {additionalConfig: {"http.max_content_length": "150mb"}}}}, min_health: red, max_unready_pods: 1, timeout: 10m}
+      - action: check_pod_exec
+        params: {command: "grep http.max_content_length config/opensearch.yml", contains: ["http.max_content_length: 150mb"]}
+      - action: wait_for_cluster_ready
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 1000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

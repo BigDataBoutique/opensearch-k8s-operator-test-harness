@@ -9,7 +9,7 @@ from oko_test_harness.models.playbook import ActionResult
 
 
 class _ScaleBase(BaseAction):
-    def apply_and_wait(self, cr, obs, message: str, expected_nodes: int, params):
+    def apply_and_wait(self, cr, obs, message: str, expected_nodes: int, params, removed: int = 0):
         k8s.replace_cr(cr)
         self.wait_cluster_running(self.timeout(self.config.timeouts.scaling))
 
@@ -23,8 +23,9 @@ class _ScaleBase(BaseAction):
                 return h
 
         k8s.wait_for("cluster settled", settled, self.timeout(self.config.timeouts.scaling), 10)
-        # scale-ups: new pods are unready while they start, so judge by cluster members lost instead of unready pods
-        return self.finish_observed(obs, message, params.get("min_health", "yellow"), params.get("max_unready_pods"), max_nodes_down=params.get("max_nodes_down", 1))
+        # scale-ups: new pods are unready while they start, so judge by cluster members lost instead of unready pods;
+        # scale-downs may lose exactly `removed` members overall but only one between consecutive samples
+        return self.finish_observed(obs, message, params.get("min_health", "yellow"), params.get("max_unready_pods"), max_nodes_down=params.get("max_nodes_down", max(1, removed)), max_step_drop=1)
 
 
 class ScaleClusterAction(_ScaleBase):
@@ -44,7 +45,7 @@ class ScaleClusterAction(_ScaleBase):
         time.sleep(obs.interval)
         pool["replicas"] = new
         expected = sum(p["replicas"] for p in cr["spec"]["nodePools"])
-        result = self.apply_and_wait(cr, obs, f"Scaled pool {component} {old} -> {new}", expected, params)
+        result = self.apply_and_wait(cr, obs, f"Scaled pool {component} {old} -> {new}", expected, params, removed=max(0, old - new))
         if result.success and new < old:
             leftover = [
                 i["metadata"]["name"]

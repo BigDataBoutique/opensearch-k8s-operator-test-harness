@@ -1,0 +1,45 @@
+metadata:
+  description: "Issue #1364 (open): with a LimitRange in the namespace (admission injects default resources into the init containers the operator creates without any), the bootstrap pod must not be recreated in a loop ('Bootstrap pod update touched immutable fields, recreating pod'); the cluster must form, reach RUNNING/green with the bootstrap pod removed, and accept data. EXPECTED TO FAIL while #1364 is unfixed if the operator's bootstrap-pod update diffs the admission-mutated fields: the cluster never forms and wait_for_cluster_ready times out."
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: create_namespace
+      - action: apply_resource
+        params:
+          manifest:
+            apiVersion: v1
+            kind: LimitRange
+            metadata: {name: oko-container-defaults}
+            spec:
+              limits:
+                - type: Container
+                  default: {cpu: "2", memory: 2Gi}
+                  defaultRequest: {cpu: 100m, memory: 128Mi}
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+
+  - name: cluster_forms_under_admission_defaults
+    steps:
+      - action: wait_for_cluster_ready
+        params: {timeout: 15m}
+      - action: check_k8s_resource
+        params: {kind: pod, name: __CLUSTER__-bootstrap-0, exists: false}
+      - action: check_k8s_resource
+        params: {kind: pod, component: nodes, expect: {spec.initContainers.0.resources.limits.memory: 2Gi}}
+      - action: validate_cluster_configuration
+        params: {total_nodes: 3}
+      - action: index_documents
+        params: {index: data-a, count: 1000, shards: 3, replicas: 1}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 1000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

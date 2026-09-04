@@ -12,10 +12,10 @@ from oko_test_harness.models.playbook import ActionResult, ActionStep, Execution
 
 
 def all_actions() -> List[Type[BaseAction]]:
-    from oko_test_harness.actions import chaos, cluster, data, features, monitoring, scaling, upgrade, validation
+    from oko_test_harness.actions import chaos, cluster, data, features, monitoring, regressions, scaling, upgrade, validation
 
     found = []
-    for mod in (cluster, data, validation, upgrade, scaling, chaos, monitoring, features):
+    for mod in (cluster, data, validation, upgrade, scaling, chaos, monitoring, features, regressions):
         for obj in vars(mod).values():
             if isinstance(obj, type) and issubclass(obj, BaseAction) and obj is not BaseAction and obj.action_name:
                 found.append(obj)
@@ -68,6 +68,7 @@ class PlaybookExecutor:
             result = holder[0] if holder else ActionResult(False, "background step produced no result")
             if not result.success and not step.continue_on_error:
                 logger.error(f"Background step '{step.action}' failed: {result.message}")
+                ctx.failure = ctx.failure or f"{ctx.current_phase}.{step.action} (background): {result.message}"
                 ok = False
         return ok
 
@@ -87,7 +88,8 @@ class PlaybookExecutor:
             logger.success(f"{step.action}: {result.message}")
         else:
             logger.error(f"{step.action} FAILED: {result.message}")
-            ctx.failure = ctx.failure or f"{key}: {result.message}"
+            if not step.continue_on_error:
+                ctx.failure = ctx.failure or f"{key}: {result.message}"
         return result
 
     def _run_with_backstop(self, action: BaseAction, step: ActionStep, ctx: ExecutionContext) -> ActionResult:

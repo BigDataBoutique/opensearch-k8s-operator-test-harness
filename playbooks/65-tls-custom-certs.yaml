@@ -29,11 +29,11 @@ phases:
             metadata: {name: oko-transport}
             spec:
               secretName: oko-transport-cert
+              privateKey: {algorithm: RSA, size: 2048, encoding: PKCS8}  # securityadmin and the nodes need PKCS#8 keys
               commonName: __CLUSTER__-node
               subject: {organizationalUnits: [oko]}
               usages: [digital signature, key encipherment, server auth, client auth]
               dnsNames: ["__CLUSTER__-discovery", "__CLUSTER__-discovery.__NAMESPACE__.svc", "*.__CLUSTER__-discovery.__NAMESPACE__.svc.cluster.local"]
-              privateKey: {algorithm: RSA, size: 2048}
               issuerRef: {name: oko-ca, kind: Issuer}
       - action: apply_resource
         params:
@@ -44,11 +44,11 @@ phases:
             metadata: {name: oko-http}
             spec:
               secretName: oko-http-cert
+              privateKey: {algorithm: RSA, size: 2048, encoding: PKCS8}  # securityadmin and the nodes need PKCS#8 keys
               commonName: __CLUSTER__
               subject: {organizationalUnits: [oko]}
               usages: [digital signature, key encipherment, server auth]
               dnsNames: ["__CLUSTER__", "__CLUSTER__.__NAMESPACE__", "__CLUSTER__.__NAMESPACE__.svc", "__CLUSTER__.__NAMESPACE__.svc.cluster.local", "*.__CLUSTER__-discovery.__NAMESPACE__.svc.cluster.local"]
-              privateKey: {algorithm: RSA, size: 2048}
               issuerRef: {name: oko-ca, kind: Issuer}
       - action: apply_resource
         params:
@@ -59,10 +59,10 @@ phases:
             metadata: {name: oko-admin}
             spec:
               secretName: oko-admin-cert
+              privateKey: {algorithm: RSA, size: 2048, encoding: PKCS8}  # securityadmin and the nodes need PKCS#8 keys
               commonName: admin
               subject: {organizationalUnits: [oko]}
               usages: [digital signature, key encipherment, client auth]
-              privateKey: {algorithm: RSA, size: 2048}
               issuerRef: {name: oko-ca, kind: Issuer}
       - action: deploy_cluster
         params:

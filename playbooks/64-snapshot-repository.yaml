@@ -1,7 +1,10 @@
 metadata:
   description: "general.snapshotRepositories registers an fs repository (single node, emptyDir additionalVolume + path.repo) that can take and restore a snapshot, a settings change is pushed to OpenSearch, and removing the repository from the spec keeps it in OpenSearch (documented)"
 
-# An fs repository must be shared by every node, which no k3d-local volume provides, so this runs on a one-node cluster.
+# An fs repository must be shared by every node, which no k3d-local volume provides (additionalVolumes has no hostPath),
+# so this runs on a one-node cluster. BLOCKED on the current operator build: a single-manager cluster never forms because
+# the bootstrap pod is removed without a voting-config exclusion (FINDINGS-new.md N10, upstream #1448). Expect this
+# playbook to fail at setup.wait_for_cluster_ready until that is fixed; the repository checks below are otherwise complete.
 phases:
   - name: setup
     steps:

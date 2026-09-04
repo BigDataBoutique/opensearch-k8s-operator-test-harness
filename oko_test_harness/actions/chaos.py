@@ -97,6 +97,10 @@ class KillOperatorAction(BaseAction):
         if not pods:
             return ActionResult(False, "No operator pod found")
         cr_phase = self.cr().get("status", {}).get("phase")
+        if pods[0]["image"].startswith("opensearch-operator:dev-"):
+            from oko_test_harness.actions.cluster import import_image_into_cluster
+
+            import_image_into_cluster(pods[0]["image"])  # kubelet image GC may have dropped it; the new pod must be able to start
         for p in pods:
             k8s.delete_pod(ns, p["name"], force=True)
         k8s.wait_for("operator pod back", lambda: [p for p in k8s.get_pods(ns, OPERATOR_SELECTOR) if p["ready"] and p["uid"] not in {q["uid"] for q in pods}], 300, 5)

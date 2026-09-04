@@ -26,6 +26,8 @@ class ClusterObserver(threading.Thread):
         self.max_pods_seen = 0
         self.min_nodes: Optional[int] = None
         self.baseline_nodes: Optional[int] = None
+        self.max_step_drop = 0  # largest decrease in cluster members between two consecutive samples
+        self._last_nodes: Optional[int] = None
         self.unreachable_seconds = 0.0
         self.max_unreachable_streak = 0.0
 
@@ -48,6 +50,9 @@ class ClusterObserver(threading.Thread):
                 if self.baseline_nodes is None:
                     self.baseline_nodes = h["number_of_nodes"]
                 self.min_nodes = h["number_of_nodes"] if self.min_nodes is None else min(self.min_nodes, h["number_of_nodes"])
+                if self._last_nodes is not None:
+                    self.max_step_drop = max(self.max_step_drop, self._last_nodes - h["number_of_nodes"])
+                self._last_nodes = h["number_of_nodes"]
                 counts = client.index_counts(list(self.baseline_counts) or None)
                 sample["counts"] = counts
                 for idx, c in counts.items():
@@ -90,16 +95,21 @@ class ClusterObserver(threading.Thread):
             "worst_health": self.worst_health,
             "baseline_nodes": self.baseline_nodes,
             "min_nodes": self.min_nodes,
+            "max_step_drop": self.max_step_drop,
             "max_unready_pods": self.max_unready_pods,
             "max_unreachable_streak_s": round(self.max_unreachable_streak),
             "baseline_counts": self.baseline_counts,
             "min_counts": self.min_counts,
         }
 
-    def violations(self, min_health: str = "yellow", max_unready_pods: Optional[int] = 1, allow_doc_loss: bool = False, max_nodes_down: Optional[int] = None) -> List[str]:
+    def violations(
+        self, min_health: str = "yellow", max_unready_pods: Optional[int] = 1, allow_doc_loss: bool = False, max_nodes_down: Optional[int] = None, max_step_drop: Optional[int] = None
+    ) -> List[str]:
         """max_unready_pods counts pods (new pods during a scale-up are unready too); max_nodes_down counts
         cluster members lost relative to the first sample, which is the better invariant for scale-ups."""
         v = []
+        if max_step_drop is not None and self.max_step_drop > max_step_drop:
+            v.append(f"{self.max_step_drop} cluster members left between two samples (allowed: {max_step_drop}; nodes must be removed one at a time)")
         if max_nodes_down is not None and self.baseline_nodes is not None and self.min_nodes is not None and self.baseline_nodes - self.min_nodes > max_nodes_down:
             v.append(f"cluster dropped from {self.baseline_nodes} to {self.min_nodes} nodes (allowed: {max_nodes_down} down)")
         if HEALTH_ORDER.get(self.worst_health, 0) < HEALTH_ORDER[min_health]:

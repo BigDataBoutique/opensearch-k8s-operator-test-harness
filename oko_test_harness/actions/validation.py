@@ -1,5 +1,6 @@
 """Validation actions. These assert what the *operator* should have produced."""
 
+import json
 import time
 from typing import Any, Dict, List
 
@@ -210,9 +211,19 @@ class ValidateOperatorStatusAction(BaseAction):
             logs = k8s.kubectl("logs", "-n", ns, pods[0]["name"], "--previous", "--tail=50", check=False)
             return ActionResult(False, f"Operator restarted {restarts} times. Last crash logs:\n{logs[-3000:]}")
         errors = k8s.kubectl("logs", "-n", ns, pods[0]["name"], "--since=30m", check=False)
-        panics = [line for line in errors.splitlines() if "panic" in line.lower() or "goroutine " in line]
+        panics = []
+        for line in errors.splitlines():
+            if not ("panic" in line.lower() or "goroutine " in line):
+                continue
+            try:  # structured line: only count it if it concerns this cluster (or names no cluster at all)
+                entry = json.loads(line)
+                if entry.get("namespace") not in (None, self.namespace):
+                    continue
+            except ValueError:
+                pass
+            panics.append(line[:300])
         if panics:
-            return ActionResult(False, f"Operator log contains panics: {panics[:3]}")
+            return ActionResult(False, f"Operator log contains panics for {self.namespace}: {panics[:3]}")
         return ActionResult(True, f"Operator {pods[0]['image']} running, {restarts} restarts, no panics in log")
 
 

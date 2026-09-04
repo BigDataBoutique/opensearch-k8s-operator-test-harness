@@ -70,6 +70,25 @@ On failure the harness always dumps operator logs, the CR, pods, PVCs, events an
 | `78-monitoring` | `monitoring.enable` installs `prometheus-exporter` on every node, `/_prometheus/metrics` serves; without prometheus-operator CRDs the ServiceMonitor is skipped with a Warning |
 | `79-security-disabled` | `security.tls.http.enabled: false` disables the security plugin: `plugins.security.disabled` in opensearch.yml, no securityconfig job, plain HTTP without credentials |
 
+### Regression playbooks
+
+Derived from recent operator issues and fixes (open issues are marked; those playbooks are expected to fail until the issue is fixed, which is the point).
+
+| Playbook | Issue | What it proves about the operator |
+|---|---|---|
+| `80-issue-1448-manager-scale-down` | #1448 (open) | Dedicated manager pool scaled 5 -> 3 and 3 -> 1 under live indexing: API never unreachable > 90s, never red, no member lost beyond the removed ones, voting configuration = surviving managers with no exclusion left, a manager rolling restart still completes. Expected to fail at 3 -> 1 (quorum lost) |
+| `81-issue-1448-bootstrap-manager-loss` | #1448 (open) | Elected manager deleted the instant the operator removes the bootstrap pod of a fresh 3-manager cluster: re-election, RUNNING/green, clean voting configuration; same after a later manager loss |
+| `82-issue-1449-single-manager-restart` | #1449 (open) | A config change on a one-node cluster still restarts the pod and lands in `opensearch.yml`. Expected to fail (quorum guard requeues forever) |
+| `83-issue-1453-crashloop-recovery` | #1453 / PR #1473 | Bad `additionalConfig` crash-loops one pod: Warning event, no second pod taken down; after the fix the operator deletes the stuck pod itself and finishes the restart one pod at a time |
+| `84-issue-1329-parallel-pods` | PR #1329 | StatefulSets are `Parallel`/`OnDelete`: a new pool's 3 pods exist within 60s, while a jvm rolling restart and the pool removal still go one pod at a time |
+| `85-issue-1476-pool-rename` | PR #1476 | Data pool renamed (remove + add in one apply) while the managers roll: the old pool drains one node at a time to completion, never 2 nodes missing, no doc loss, old STS gone, `exclude._name` cleared |
+| `86-issue-1447-drain-fail-closed` | #1447 | Scale-down of a node holding an index pinned to it: node kept with its shards, Scaler Warning + `DrainStalled` after 15m, scale-down completes once unpinned (~25 min) |
+| `87-issue-1455-emptydir-readiness-blip` | #1455 | All emptyDir JVMs frozen 3 min (probes fail cluster-wide): no `EmptyDirRecovery` teardown, same pod UIDs, green again with all documents |
+| `88-issue-1456-securityconfig-job-retry` | #1456 | Unloadable `roles.yml`: job fails, Warning `Securityconfig update job failed, retrying`, `Securityconfig: Failed` status, cluster keeps serving; repaired secret -> job succeeds |
+| `89-issue-1451-tls-rotation` | #1451 | Generated 30-day certs; switching to 365-day + `rotateDaysBeforeExpiry: 60` renews them and the nodes *serve* the new HTTP certificate (>= 300 days) with the cluster RUNNING and no doc loss |
+| `90-issue-1450-restart-after-scaler` | #1450 #1471 #1369 | Rolling restart of every pool after a scale-down left a `Scaler` status first: one pod at a time, `allocation.enable` back to `all`, `RollingRestart: Finished`; a manager-only change rolls only the managers |
+| `91-issue-1364-limitrange-bootstrap` | #1364 (open) | A namespace `LimitRange` (admission-injected init-container resources) must not send the bootstrap pod into a recreate loop; the cluster forms. May fail while unfixed |
+
 ## Playbook format
 
 ```yaml
@@ -115,6 +134,13 @@ randomised per run unless set in `config`.
   `cluster_params`/`manifest` must be denied by the webhook with `message`; the CR must be unchanged),
   `delete_namespace`, `delete_cluster_check_pvcs`, `wait_dashboards_version` (rolling update with `max_unavailable`).
   Manifests, names and paths may use `__CLUSTER__` / `__NAMESPACE__` placeholders (the names are random per run).
+- **Regression checks** (`actions/regressions.py`): `scale_cluster_managers` (manager pool scale under the observer, fails fast
+  when the API is unreachable > `max_unreachable`, then checks the voting configuration), `check_voting_config`,
+  `delete_pod_after_bootstrap` (deletes the elected manager the moment the bootstrap pod is removed), `rolling_restart`
+  (`patch`/`node_pool` change; every pod of `expect_pools` replaced, others untouched, one down at a time, invariants restored),
+  `wait_crashloop_recovery`, `edit_node_pools` (`add`/`remove`/`update` pools in one apply, `wait: false` to just apply),
+  `pause_pods` (SIGSTOP the JVMs for `duration`; no emptyDir teardown, same pod UIDs), `patch_secret`, `check_served_cert`
+  (`min_days`/`max_days` of the HTTP certificate the pods actually serve), `create_namespace`.
 
 ## Running the suite
 

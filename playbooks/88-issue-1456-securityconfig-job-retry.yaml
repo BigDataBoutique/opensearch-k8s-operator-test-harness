@@ -1,0 +1,55 @@
+metadata:
+  description: "Issue #1456 (fixed by 2eabcd4): a failed securityconfig-update job must be retried and surfaced, never treated as applied. The securityconfig secret is changed to a roles.yml securityadmin cannot load: the job fails, the operator emits a Security Warning 'Securityconfig update job failed, retrying' with a Failed Securityconfig component status while the cluster keeps serving with the old config; after the secret is repaired the job must run again and succeed, the broken role must not exist and the cluster stays RUNNING. Unfixed operators compared only the checksum annotation and left a Failed job in place forever (admin password rotation wedged the cluster)."
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: check_k8s_resource
+        params: {kind: job, name: __CLUSTER__-securityconfig-update, expect: {status.succeeded: 1}}
+      - action: index_documents
+        params: {index: data-a, count: 1000, shards: 3, replicas: 1}
+
+  - name: broken_securityconfig_is_retried_and_surfaced
+    steps:
+      - action: patch_secret
+        params:
+          name: securityconfig-secret
+          data:
+            roles.yml: "_meta:\n  type: roles\n  config_version: 2\nbroken_role:\n  cluster_permissions: not-a-list\n  index_permissions: nope\n"
+      - action: expect_event
+        params: {reason: Security, type: Warning, contains: "Securityconfig update job failed, retrying", timeout: 20m}
+      - action: check_k8s_resource
+        params:
+          kind: opensearchclusters.opensearch.org
+          name: __CLUSTER__
+          expect: {status.componentsStatus: [{component: Securityconfig, status: Failed}]}
+      - action: check_opensearch_api
+        params: {path: /_cluster/health, expect: {status: green}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 1000}
+
+  - name: repaired_securityconfig_is_applied
+    steps:
+      - action: patch_secret
+        params:
+          name: securityconfig-secret
+          data:
+            roles.yml: "_meta:\n  type: roles\n  config_version: 2\n"
+      - action: check_k8s_resource
+        params: {kind: job, name: __CLUSTER__-securityconfig-update, expect: {status.succeeded: 1}, timeout: 20m}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/api/roles, absent: ["broken_role"]}
+      - action: wait_for_cluster_ready
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

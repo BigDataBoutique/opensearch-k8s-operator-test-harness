@@ -77,6 +77,8 @@ class ApplyResourceAction(BaseAction, _Placeholders):
     def execute(self, params):
         obj = self.fill(params["manifest"])
         obj.setdefault("metadata", {}).setdefault("namespace", self.namespace)
+        if obj["kind"] != "Namespace":
+            k8s.ensure_namespace(obj["metadata"]["namespace"])  # resources are often applied before deploy_cluster creates it
         k8s.apply(json.dumps(obj), obj["metadata"]["namespace"])
         ref = f"{obj['kind']}/{obj['metadata']['name']}"
         condition = params.get("wait_condition")
@@ -126,13 +128,13 @@ class CheckOpenSearchApiAction(BaseAction, _Placeholders):
                 problems += [f"body contains {s!r}" for s in params.get("absent") or [] if s in r.text]
             if problems:
                 raise Exception("; ".join(problems))
-            return r
+            return {"response": r}  # a bare Response is falsy for non-2xx codes, which wait_for would read as "not met"
 
         with client:
             # the port-forward probe in connect() needs a working login, so connect as admin and only then act as `user`
             if user:
                 client.session.auth = (user.get("username", ""), user.get("password", ""))
-            r = k8s.wait_for(f"{method} {path}", check, self.timeout("3m"), 5)
+            r = k8s.wait_for(f"{method} {path}", check, self.timeout("3m"), 5)["response"]
         who = user.get("username", s.username)
         return ActionResult(True, f"{method} {path} as {who} -> {r.status_code}" + (f", {params['expect']}" if params.get("expect") else ""))
 
@@ -187,6 +189,7 @@ class CheckPodExecAction(BaseAction, _Placeholders):
 
     def execute(self, params):
         pods = k8s.get_pods(self.namespace, self.sub(params["selector"])) if params.get("selector") else self.pods(params.get("component"))
+        pods = [p for p in pods if p["ready"] and not p["deletion"]]  # pods of a superseded ReplicaSet may be terminating
         if not pods:
             return ActionResult(False, f"No pods for {params.get('selector') or params.get('component')}")
         targets = pods if params.get("all_pods") else pods[:1]

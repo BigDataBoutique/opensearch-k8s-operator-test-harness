@@ -8,7 +8,7 @@ starting a run; README.md explains the playbook format and actions.
 ```bash
 which k3d helm kubectl docker go make          # k3d + helm live in ~/.local/bin
 sysctl vm.max_map_count                        # must be >= 262144 (host kernel is shared with k3d nodes)
-df -h /                                        # < 85% used is comfortable; see "disk watermarks" below
+df -h /                                        # keep < 80% used: k3d kubelets GC images above 85% and evict pods below 5% free (setup_cluster relaxes this for new clusters)
 k3d cluster list; kubectl config current-context   # expect cluster `oko`, context `k3d-oko`
 kubectl get pods -n cert-manager -n opensearch-operator-system   # cert-manager + operator Running
 poetry install && poetry run pytest -q && poetry run oko-test validate
@@ -29,7 +29,7 @@ nohup bash -c "poetry run oko-test -v --log-file logs/run-$pb.log run playbooks/
 nohup scripts/run-lane.sh A playbooks/12-coordinator-nodes.yaml playbooks/20-upgrade-minor-2x.yaml >/dev/null 2>&1 &
 ```
 
-Concurrency: **at most 2 playbooks at a time** on a laptop-class box; the operator-upgrade playbook (`50-*`)
+Concurrency: **at most 2 playbooks at a time** on a laptop-class box (three clusters booting at once pushed IO pressure above 50% and made containerd miss stop deadlines); the operator-upgrade playbook (`50-*`)
 must run **alone** (it replaces the shared operator). Every playbook uses its own random namespace and cluster
 name, and `install_operator` is idempotent, so lanes can share the k3d cluster and the operator.
 
@@ -93,6 +93,12 @@ observed *during* the operation; a violation there is the signal that matters fo
 | `k3d image import failed: Failed to run tools container` | Two playbooks importing at once | `install_operator` skips build/import when the operator already runs the wanted image and retries imports. |
 | IO pressure (`cat /proc/pressure/io` inside a node > 30% `full`) | Image imports + several clusters starting + plugin downloads; an unthrottled background indexer once wrote 2.3M docs in 8 min | Run ≤ 2 playbooks concurrently; pre-pull images *before* starting runs; background `index_documents` is throttled by `rate` (default 100 docs/s). |
 | `'Event' object is not callable` at the end of an observed step | Observer thread shadowed `threading.Thread._stop` | Fixed (`_stop_event`); covered by a unit test. |
+| Operator pod `ImagePullBackOff` after `kill_operator`; `crictl images` on every node shows no `opensearch-operator:dev-*` | kubelet image GC (host > 85% used) deleted the locally imported image; the replacement pod cannot pull it from anywhere | `install_operator` re-imports on its fast path and `kill_operator` re-imports before killing. Manual fix: `k3d image import opensearch-operator:<tag> -c oko`. New clusters get relaxed GC/eviction kubelet args from `setup_cluster`. |
+| Pod stuck `Terminating` for many minutes, event `FailedKillPod ... DeadlineExceeded` | containerd in the k3d node cannot stop the container under IO pressure | `kubectl delete pod --force --grace-period=0`; the StatefulSet recreates it from its PVC. |
+| Cluster yellow for 15+ min after two pods were force-killed at once; `_cat/recovery` shows peer recoveries at stage `init`, 0%, no log errors | OpenSearch peer recovery hung on the *source* node (the manager whose java was SIGKILLed in place) | Restart the source node, not the target (target restart re-hangs). Cluster went green in ~1 min with all data. Not an operator issue (FINDINGS N9); `40-chaos` runs this as a non-blocking last phase. |
+| `check_opensearch_api` reports "condition not met" for an expected 4xx | `wait_for` predicate returned a `requests.Response`, which is falsy for non-2xx | Fixed: predicates must return a truthy container, never a bare Response. |
+| `apply_resource` fails with `namespaces "oko-xxxxx" not found` | Resource applied before `deploy_cluster` created the namespace | Fixed: `apply_resource` ensures the namespace. |
+| A fresh 1-manager cluster never forms; CR says RUNNING; node log `an election requires a node with id [...]` = the bootstrap pod | Operator issue #1448 (bootstrap removed without voting-config exclusion) | Use 3 managers in playbooks that are not about quorum (FINDINGS N10). |
 
 ## 5. Version knobs
 

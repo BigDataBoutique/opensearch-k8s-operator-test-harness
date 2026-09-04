@@ -23,7 +23,9 @@ phases:
         background: true
         params: {index: data-live, count: 200, replicas: 1, duration: 12m, min_success_ratio: 0.9}
       - action: upgrade_cluster
-        params: {target_version: "${OS_VERSION_3X:-3.8.0}", max_unready_pods: 1, min_health: green}
+        # yellow is allowed only because system indices with auto_expand_replicas 0-all keep one unassigned replica while
+        # a node is out; user indices with replicas: 1 stay fully available and the observer proves no document loss
+        params: {target_version: "${OS_VERSION_3X:-3.8.0}", max_unready_pods: 1, min_health: yellow}
       - action: wait_for_cluster_ready
         params: {expect_version: "${OS_VERSION_3X:-3.8.0}"}
       - action: validate_data_integrity
@@ -32,7 +34,7 @@ phases:
   - name: scale_down_with_drain
     steps:
       - action: scale_cluster
-        params: {component: data, replicas: 2, min_health: green, max_unready_pods: 1}
+        params: {component: data, replicas: 2, min_health: yellow, max_unready_pods: 1}
       - action: wait_for_cluster_ready
       - action: validate_cluster_configuration
         params: {total_nodes: 5, roles: {cluster_manager: 3, data: 2}}

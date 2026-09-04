@@ -1,0 +1,66 @@
+metadata:
+  description: "Issue #1447 (fixed by 7490bf2): scale-down drain checks fail closed. An index pinned to the node being removed (index.routing.allocation.require._name) can never drain; the operator must keep that node (pod Running, shards still on it, documents intact), report the stall after 15 minutes with a Scaler Warning event and a DrainStalled condition instead of removing a node that still holds data, and complete the scale-down once the pin is lifted, with exclude._name cleared. Unfixed operators marked the pool Drained on the first API hiccup and deleted the node with its shards (red index / lost documents). Runs about 25 minutes because the stall threshold is 15m."
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          extra_spec: {confMgmt: {smartScaler: true}}
+          node_pools:
+            - {component: masters, replicas: 3, roles: ["cluster_manager"]}
+            - {component: data, replicas: 3, roles: ["data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 2000, shards: 3, replicas: 1}
+      - action: index_documents
+        params: {index: pinned, count: 500, shards: 1, replicas: 1}
+      - action: check_opensearch_api
+        params:
+          method: PUT
+          path: /pinned/_settings
+          body: {index: {routing: {allocation: {require: {_name: "__CLUSTER__-data-2"}}}}}
+      - action: check_opensearch_api
+        params: {path: "/_cat/shards/pinned?format=json&h=node,prirep,state", contains: ["data-2"]}
+
+  - name: scale_down_stalls_on_the_pinned_index
+    steps:
+      - action: scale_cluster
+        background: true
+        params: {component: data, replicas: 2, min_health: yellow, max_unready_pods: 1, timeout: 45m}
+      - action: expect_event
+        params: {reason: Scaler, type: Warning, contains: "has made no progress", timeout: 30m}  # documented after 15m of no progress; observed at ~22m
+      - action: check_k8s_resource
+        params: {kind: pod, name: __CLUSTER__-data-2, expect: {status.phase: Running}}
+      - action: check_k8s_resource
+        params:
+          kind: opensearchclusters.opensearch.org
+          name: __CLUSTER__
+          expect: {status.componentsStatus: [{component: Scaler, status: Excluded, conditions: [DrainStalled]}]}
+      - action: check_opensearch_api
+        params: {path: "/_cat/shards/pinned?format=json&h=node,prirep,state", contains: ["data-2"]}
+      - action: validate_data_integrity
+        params: {index: pinned, expected_documents: 500}
+      - action: check_opensearch_api
+        params:
+          method: PUT
+          path: /pinned/_settings
+          body: {index: {routing: {allocation: {require: {_name: null}}}}}
+
+  - name: scale_down_completes_after_unpinning
+    steps:
+      - action: wait_for_cluster_ready
+      - action: validate_cluster_configuration
+        params: {total_nodes: 5, roles: {cluster_manager: 3, data: 2}}
+      - action: validate_data_integrity
+        params: {index: pinned, expected_documents: 500}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

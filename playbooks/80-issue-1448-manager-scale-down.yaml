@@ -1,0 +1,58 @@
+metadata:
+  description: "Issue #1448 (open): the operator never uses voting-config exclusions when removing cluster-manager-eligible nodes. A dedicated manager pool is scaled 5 -> 3 and then 3 -> 1 with data on the cluster and live indexing; the API may never be unreachable for more than 90s, health never red, no member beyond the removed ones may be lost, the voting configuration afterwards must hold exactly the surviving managers with no exclusion left, and a rolling restart of the managers (jvm change) must still complete. EXPECTED TO FAIL while #1448 is unfixed: 3 -> 1 removes two of three voters back-to-back and the cluster loses quorum (scale_cluster_managers fails fast on the unreachable API); 5 -> 3 may pass only because OpenSearch auto-shrinks the voting configuration between removals. If a future webhook refuses manager scale-downs below 3, turn the last phase into expect_rejected."
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          extra_spec: {confMgmt: {smartScaler: true}}
+          node_pools:
+            - {component: masters, replicas: 5, roles: ["cluster_manager"]}
+            - {component: data, replicas: 2, roles: ["data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: check_voting_config
+        params: {component: masters}
+      - action: index_documents
+        params: {index: data-a, count: 3000, shards: 2, replicas: 1}
+
+  - name: scale_managers_5_to_3
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 6m, min_success_ratio: 0.9}
+      - action: scale_cluster_managers
+        params: {component: masters, replicas: 3, max_unreachable: 90s, min_health: yellow}
+      - action: wait_for_cluster_ready
+      - action: validate_cluster_configuration
+        params: {total_nodes: 5, roles: {cluster_manager: 3, data: 2}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 3000}
+
+  - name: rolling_restart_after_scale_down
+    steps:
+      - action: rolling_restart
+        params: {node_pool: {component: masters, jvm: "-Xmx700m -Xms700m"}, expect_pools: [masters], max_unready_pods: 1, min_health: yellow}
+      - action: check_voting_config
+        params: {component: masters}
+      - action: wait_for_cluster_ready
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 3000}
+
+  - name: scale_managers_3_to_1
+    steps:
+      - action: scale_cluster_managers
+        params: {component: masters, replicas: 1, max_unreachable: 90s, min_health: yellow, timeout: 10m}
+      - action: wait_for_cluster_ready
+      - action: validate_cluster_configuration
+        params: {total_nodes: 3, roles: {cluster_manager: 1, data: 2}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 3000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

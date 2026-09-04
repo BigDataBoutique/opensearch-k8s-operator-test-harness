@@ -1,0 +1,55 @@
+metadata:
+  description: "PR #1329 (merged): StatefulSets use podManagementPolicy Parallel with updateStrategy OnDelete. All pods of a newly added pool are created at once (three pods present within 60s of adding the pool, which OrderedReady could not do), while rolling operations on that pool (jvm change) and its removal still take one pod at a time with health >= yellow and no document loss. Fixes the OrderedReady quorum deadlocks reported in #1365 and #1393."
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          extra_spec: {confMgmt: {smartScaler: true}}
+          node_pools:
+            - {component: masters, replicas: 3, roles: ["cluster_manager"]}
+            - {component: data, replicas: 2, roles: ["data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 2000, shards: 2, replicas: 1}
+
+  - name: new_pool_starts_in_parallel
+    steps:
+      - action: check_k8s_resource
+        params:
+          kind: statefulset
+          selector: "opensearch.org/opensearch-cluster=__CLUSTER__"
+          min_count: 2
+          expect: {spec.podManagementPolicy: Parallel, spec.updateStrategy.type: OnDelete}
+      - action: edit_node_pools
+        params: {add: [{component: extra, replicas: 3, roles: ["data"]}], wait: false}
+      - action: check_k8s_resource
+        params: {kind: pod, component: extra, min_count: 3, timeout: 60s}
+      - action: wait_for_cluster_ready
+        params: {timeout: 15m}
+      - action: validate_cluster_configuration
+        params: {total_nodes: 8, roles: {cluster_manager: 3, data: 5}}
+
+  - name: rolling_operations_stay_serial
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 8m, min_success_ratio: 0.9}
+      - action: rolling_restart
+        params: {node_pool: {component: extra, jvm: "-Xmx700m -Xms700m"}, expect_pools: [extra], max_unready_pods: 1, min_health: yellow}
+      - action: remove_node_pool
+        params: {component: extra, max_unready_pods: 1, max_nodes_down: 3, min_health: yellow}
+      - action: wait_for_cluster_ready
+      - action: validate_cluster_configuration
+        params: {total_nodes: 5, roles: {cluster_manager: 3, data: 2}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

@@ -1,0 +1,46 @@
+metadata:
+  description: "Issue #1451 (fixed by 1fcc353): renewed operator-generated TLS certificates must actually reach the running nodes. The cluster starts with 30-day generated certificates and rotation disabled (served HTTP certificate has 25-31 days left); switching to 365-day certificates with rotateDaysBeforeExpiry 60 must make the operator renew them and the nodes serve the new certificate (>= 300 days left, via hot reload or a rolling restart) while the cluster stays RUNNING, admin still authenticates and no document is lost under live indexing. Unfixed operators rotated the Secret only (nodes kept the old in-memory certificate until expiry) or never rotated at all."
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+          extra_spec:
+            security:
+              tls:
+                transport: {generate: true, perNode: true, duration: "720h", rotateDaysBeforeExpiry: -1}
+                http: {generate: true, duration: "720h", rotateDaysBeforeExpiry: -1}
+      - action: wait_for_cluster_ready
+      - action: check_served_cert
+        params: {component: nodes, min_days: 25, max_days: 31}
+      - action: index_documents
+        params: {index: data-a, count: 2000, shards: 3, replicas: 1}
+
+  - name: rotation_reaches_the_nodes
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 8m, min_success_ratio: 0.9}
+      - action: patch_cluster
+        params:
+          patch: {spec: {security: {tls: {transport: {duration: "8760h", rotateDaysBeforeExpiry: 60}, http: {duration: "8760h", rotateDaysBeforeExpiry: 60}}}}}
+          wait_running: true
+          timeout: 15m
+      - action: check_served_cert
+        params: {component: nodes, min_days: 300, timeout: 12m}
+      - action: wait_for_cluster_ready
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/api/internalusers/admin, status: 200}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

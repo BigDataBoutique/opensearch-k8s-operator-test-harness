@@ -76,10 +76,10 @@ class BaseAction(ABC):
         obs.start()
         return obs
 
-    def finish_observed(self, obs: ClusterObserver, message: str, min_health="yellow", max_unready_pods=1, allow_doc_loss=False, max_nodes_down=None) -> ActionResult:
+    def finish_observed(self, obs: ClusterObserver, message: str, min_health="yellow", max_unready_pods=1, allow_doc_loss=False, max_nodes_down=None, max_step_drop=None) -> ActionResult:
         summary = obs.stop()
         self.logger.info(f"observer summary: {summary}")
-        violations = obs.violations(min_health=min_health, max_unready_pods=max_unready_pods, allow_doc_loss=allow_doc_loss, max_nodes_down=max_nodes_down)
+        violations = obs.violations(min_health=min_health, max_unready_pods=max_unready_pods, allow_doc_loss=allow_doc_loss, max_nodes_down=max_nodes_down, max_step_drop=max_step_drop)
         if violations:
             return ActionResult(False, f"{message}; invariants violated during operation: {'; '.join(violations)}", summary)
         return ActionResult(True, f"{message}; during operation: worst health={summary['worst_health']}, max unready pods={summary['max_unready_pods']}, no document loss", summary)

@@ -44,6 +44,10 @@ class SetupClusterAction(BaseAction):
                 sh(["kubectl", "config", "use-context", f"k3d-{k.cluster_name}"])
                 return ActionResult(True, f"k3d cluster {k.cluster_name} already exists")
             cmd = ["k3d", "cluster", "create", k.cluster_name, "--agents", str(nodes), "--wait", "--timeout", "5m"]
+            # k3d nodes share the host disk: on a busy laptop the kubelet defaults (image GC at 85%, eviction at 5% free)
+            # continuously garbage-collect pre-pulled images and can evict OpenSearch pods; relax them for a test cluster
+            for arg in ("image-gc-high-threshold=97", "image-gc-low-threshold=95", "eviction-hard=nodefs.available<2%,imagefs.available<2%"):
+                cmd += ["--k3s-arg", f"--kubelet-arg={arg}@agent:*", "--k3s-arg", f"--kubelet-arg={arg}@server:*"]
             if version:
                 cmd += ["--image", f"rancher/k3s:{version}-k3s1"]
             sh(cmd)
@@ -80,6 +84,8 @@ class InstallOperatorAction(BaseAction):
             image = local_operator_image(go_dir)
             running = [p for p in k8s.get_pods(ns, OPERATOR_SELECTOR) if p["ready"]]
             if running and all(p["image"] == image for p in running) and not params.get("values") and not params.get("values_file") and "legacy_api" not in params:
+                # kubelet image GC on a full host removes unused-looking images; re-import so a restarted operator pod can start
+                import_image_into_cluster(image)
                 return ActionResult(True, f"Operator already running {image} in {ns}", {"image": image})
             build_local_operator(go_dir, image)
             repo, tag = image.rsplit(":", 1)
@@ -159,6 +165,11 @@ def build_local_operator(go_dir: str, image: str) -> None:
         sh(["make", "docker-build", f"IMG={image}"], cwd=go_dir, timeout=1800)
     else:
         logger.info(f"Reusing already built operator image {image}")
+    import_image_into_cluster(image)
+
+
+def import_image_into_cluster(image: str) -> None:
+    """Load a local docker image into the k3d/kind nodes (idempotent, retried: k3d's tools container is single-instance)."""
     ctx = k8s.current_context()
     if ctx.startswith("k3d-"):
         cmd = ["k3d", "image", "import", image, "-c", ctx[4:]]
@@ -167,7 +178,7 @@ def build_local_operator(go_dir: str, image: str) -> None:
     else:
         logger.warning(f"Context {ctx} is neither k3d nor kind; assuming {image} is reachable by the cluster")
         return
-    for attempt in range(5):  # concurrent playbooks may import at the same time; k3d's tools container is single-instance
+    for attempt in range(5):
         try:
             sh(cmd, timeout=600)
             return

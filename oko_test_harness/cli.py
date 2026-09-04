@@ -62,7 +62,7 @@ def run(playbooks, var, continue_on_error):
             continue
         ctx = PlaybookExecutor().execute(pb, variables)
         _print_results(ctx)
-        outcomes[str(path)] = ctx.status.value + (f" ({ctx.failure})" if ctx.failure else "")
+        outcomes[str(path)] = ctx.status.value + (f" ({ctx.failure})" if ctx.failure and ctx.status != ExecutionStatus.SUCCESS else "")
         if ctx.status != ExecutionStatus.SUCCESS and not continue_on_error:
             break
     click.echo("\nSummary:")

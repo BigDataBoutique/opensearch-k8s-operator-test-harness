@@ -1,0 +1,46 @@
+metadata:
+  description: "Issue #1453 / PR #1473 (fixed): a rolling restart stalled by a pod crash-looping on a bad additionalConfig (unknown setting) must be surfaced with a RollingRestart Warning event naming CrashLoopBackOff, must not take a second pod down meanwhile, and once the spec is repaired the operator must delete the stuck pod itself ('Deleted stuck CrashLoopBackOff pod'), finish the restart with at most one pod down at a time, drop the bad key from opensearch.yml and end RUNNING/green with all documents. Open finding N1: the same recovery is still missing for ImagePullBackOff (see 23-upgrade-abort)."
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 2000, shards: 3, replicas: 1}
+
+  - name: bad_config_stalls_the_restart
+    steps:
+      - action: patch_cluster
+        params: {patch: {spec: {general: {additionalConfig: {"oko.invalid.setting": "true"}}}}}
+      - action: expect_event
+        params: {reason: RollingRestart, type: Warning, contains: "CrashLoopBackOff", timeout: 10m}
+      - action: check_opensearch_api
+        params: {path: /_cluster/health, expect: {number_of_nodes: 2}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+
+  - name: repaired_config_recovers
+    steps:
+      - action: patch_cluster
+        params: {patch: {spec: {general: {additionalConfig: {"oko.invalid.setting": null}}}}}
+      - action: expect_event
+        params: {reason: RollingRestart, type: Warning, contains: "Deleted stuck CrashLoopBackOff pod", timeout: 10m}
+      - action: wait_crashloop_recovery
+        params: {max_unready_pods: 1, min_health: yellow, timeout: 15m}
+      - action: wait_for_cluster_ready
+      - action: check_pod_exec
+        params: {all_pods: true, command: "grep oko.invalid.setting config/opensearch.yml; echo rc=$?", contains: ["rc=1"]}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster
