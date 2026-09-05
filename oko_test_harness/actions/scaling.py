@@ -24,6 +24,11 @@ class _ScaleBase(BaseAction):
                 return h
 
         k8s.wait_for("cluster settled", settled, self.timeout(self.config.timeouts.scaling), 10)
+        # the operator starts a rolling restart a few seconds after the Scaler finishes (#1450); wait for it too instead
+        # of letting the next step race a restarting primary
+        time.sleep(20)
+        self.wait_cluster_running(self.timeout(self.config.timeouts.scaling))
+        k8s.wait_for("cluster settled", settled, self.timeout(self.config.timeouts.scaling), 10)
         # scale-ups: new pods are unready while they start, so judge by cluster members lost instead of unready pods;
         # scale-downs may lose exactly `removed` members overall but only one between consecutive samples
         return self.finish_observed(obs, message, params.get("min_health", "yellow"), params.get("max_unready_pods"), max_nodes_down=params.get("max_nodes_down", max(1, removed)), max_step_drop=step_drop)

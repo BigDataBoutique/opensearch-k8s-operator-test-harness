@@ -40,9 +40,15 @@ class WaitForClusterReadyAction(BaseAction):
         cr = self.wait_cluster_running(timeout, params.get("expect_version"))
         target = params.get("health", "green")
 
+        expected_nodes = sum(int(p.get("replicas", 0)) for p in self.cr()["spec"].get("nodePools", []))
+
         def healthy():
             with self.os_client() as c:
                 h = c.health()
+                # the bootstrap pod stays a cluster member (and often the elected manager) for a while after RUNNING;
+                # requests issued while it leaves can hang in the election, so wait for the real membership
+                if expected_nodes and h["number_of_nodes"] != expected_nodes:
+                    raise Exception(f"{h['number_of_nodes']} cluster members, expected {expected_nodes} (bootstrap pod still a member?)")
                 if not health_at_least(h["status"], target):
                     raise Exception(f"health {h['status']} (unassigned={h['unassigned_shards']}, relocating={h['relocating_shards']})")
                 if h["relocating_shards"] or h["initializing_shards"]:

@@ -9,4 +9,4 @@ scripts/run-lane.sh S0 $(p 10)
 scripts/run-lane.sh S1 $(p 11 12 20 22 30 40 60 64 65 66 67 68 69 70 72 73 74 80 82 84 86 88) &
 scripts/run-lane.sh S2 $(p 21 23 41 75 76 77 78 79 81 83 85 87 89 90 91) &
 wait
-scripts/run-lane.sh S3 $(p 50 51)
+scripts/run-lane.sh S3 $(p 51 50)  # 51 first: 50 is expected to fail (N25) and keeps its namespace, which would block the next operator replacement

@@ -86,7 +86,7 @@ class ClusterObserver(threading.Thread):
 
     def stop(self) -> Dict[str, Any]:
         self._stop_event.set()
-        self.join(timeout=self.interval * 3)
+        self.join(timeout=max(self.interval * 3, 30))  # a sample may be inside a slow kubectl call
         return self.summary()
 
     def summary(self) -> Dict[str, Any]:

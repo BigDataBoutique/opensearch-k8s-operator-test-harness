@@ -1,5 +1,5 @@
 metadata:
-  description: "security.tls.http.enabled: false disables the security plugin (documented switch): opensearch.yml gets plugins.security.disabled, no securityconfig job runs, the REST API answers plain HTTP without credentials, and data operations work"
+  description: "Disabling both HTTP and transport TLS disables the security plugin (since #1518 the plugin stays on while either is enabled; the user guide still names HTTP TLS alone as the switch, FINDINGS-round3 N28): opensearch.yml gets plugins.security.disabled, no securityconfig job runs, the REST API answers plain HTTP without credentials, and data operations work"
 
 config:
   opensearch:
@@ -19,6 +19,7 @@ phases:
             security:
               tls:
                 http: {enabled: false, generate: false}
+                transport: {enabled: false, generate: false}
       - action: wait_for_cluster_ready
 
   - name: verify
