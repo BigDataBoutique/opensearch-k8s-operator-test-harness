@@ -117,6 +117,23 @@ class ValidateClusterConfigurationAction(BaseAction):
     params = {"total_nodes", "roles", "plugins", "cluster_settings", "coordinator_nodes"}
 
     def execute(self, params):
+        # the operator may still be rolling pods right after RUNNING (2.x operators expose no in-flight status for the
+        # post-bootstrap restart), so the expectations are polled: they must hold, but not on the first sample
+        last = [None]
+
+        def check():
+            r = self._check(params)
+            last[0] = r
+            if not r.success:
+                raise Exception(r.message)
+            return r
+
+        try:
+            return k8s.wait_for("cluster configuration", check, self.timeout("3m"), 10)
+        except TimeoutError:
+            return last[0]
+
+    def _check(self, params):
         errors = []
         with self.os_client() as c:
             nodes = c.nodes()

@@ -55,6 +55,29 @@ def cluster_resource(api_group: str) -> str:
     return f"opensearchclusters.{api_group}"
 
 
+def operator_crs(namespace: Optional[str] = None) -> List[str]:
+    """Every operator-managed CR (clusters and child resources, both API groups) as 'kind ns/name'."""
+    found = []
+    for group in ("opensearch.org", "opensearch.opster.io"):
+        for kind in kubectl("api-resources", f"--api-group={group}", "-o", "name", check=False).split():
+            args = ["-n", namespace] if namespace else ["-A"]
+            for i in (get_json(kind, *args) or {}).get("items", []):
+                found.append(f"{kind} {i['metadata']['namespace']}/{i['metadata']['name']}")
+    return found
+
+
+def strip_operator_finalizers(namespace: str) -> List[str]:
+    """Remove finalizers from every operator CR in a namespace that is already being deleted, so a namespace or CRD
+    deletion cannot deadlock once the operator is gone (N23). Cleanup only: never call this while asserting on the operator."""
+    freed = []
+    for entry in operator_crs(namespace):
+        kind, ref = entry.split(" ", 1)
+        name = ref.split("/", 1)[1]
+        kubectl("patch", kind, name, "-n", namespace, "--type=merge", "-p", '{"metadata":{"finalizers":[]}}', check=False)
+        freed.append(entry)
+    return freed
+
+
 def selector(cluster: str, component: Optional[str] = None) -> str:
     sel = f"{CLUSTER_LABEL}={cluster}"
     if component:

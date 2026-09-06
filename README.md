@@ -44,19 +44,26 @@ On failure the harness always dumps operator logs, the CR, pods, PVCs, events an
 |---|---|
 | `10-basic-3x` | 3.x cluster with plugins, `additionalConfig`, Dashboards; pod resources/JVM/PVCs/labels match the CR |
 | `11-basic-2x` | 2.19.x with dedicated cluster managers and data nodes |
-| `12-coordinator-nodes` | `roles: []` pool yields coordinator-only nodes (issue #1023) |
+| `12-coordinator-nodes` | `roles: []` pool yields coordinator-only nodes (issue #1023); a rolling upgrade with a shard-less pool completes under load |
 | `20-upgrade-minor-2x` | Minor rolling upgrade under live indexing, one pod down at a time, no doc loss |
 | `21-upgrade-major-2x-to-3x` | Major upgrade of a multi-pool cluster with existing + live data; new data on 3.x |
 | `22-upgrade-minor-3x` | Minor 3.x upgrade with plugins reinstalled on the new version |
 | `23-upgrade-abort` | Unpullable target version gets stuck; reverting the spec recovers; a real upgrade works afterwards |
 | `30-scaling` | Scale data nodes up and down (shard relocation, exclusions cleared), add and remove a node pool |
-| `40-chaos` | Pod delete, SIGKILL, cluster-manager loss, two pods at once, operator restart, k8s node outage |
+| `31-scale-and-upgrade-together` | A version bump and a data-pool scale-up in the same reconcile window: Upgrader and Scaler serialised, one pod down at a time, both changes applied; then a scale-down concurrent with a config-change restart (fails on N29 while it stands) |
+| `40-chaos` | Pod delete, SIGKILL, cluster-manager loss, disk loss (pod + PVC), two pods at once, operator restart, k8s node outage |
 | `41-upgrade-under-chaos` | Operator killed and a pod deleted in the middle of a rolling upgrade; upgrade still completes |
-| `50-operator-upgrade` | Cluster made by the previous released operator (`opensearch.opster.io`); upgrading to the local build leaves it untouched, migrates it to `opensearch.org`, and it can still be upgraded |
+| `50-operator-upgrade` | Cluster made by the previous released operator (`opensearch.opster.io`); upgrading to the local build leaves it untouched, migrates it to `opensearch.org`, and it can still be upgraded (blocked by N25: legacy `dashboards.replicas: 0`) |
+| `51-operator-upgrade-migrated` | Same flow with `dashboards.replicas: 1`, so the migration and the post-migration OpenSearch upgrade are exercised |
+| `52-migration-2.3-chart-shape` | Operator **2.3.2** (built from its git tag) with a chart-shaped cluster (`master` role name, Dashboards, drainDataNodes): migration keeps REST-created users/templates/policies/settings, transfers cert-secret ownership, backfills PVC/pod labels, Dashboards stay up, 2.x -> 3.x upgrade of OpenSearch + Dashboards afterwards, deleting the new CR cascades to the legacy CR and secrets |
+| `53-migration-2.8-multi-pool-crds` | Operator **2.8.0**, managers + data pool (pdb, labels, nodeSelector, per-pool config), smartScaler, plugins, additionalVolumes, keystore, and every legacy child CRD (Role/User/UserRoleBinding/Tenant/ActionGroup/ISMPolicy/ComponentTemplate/IndexTemplate): all migrate with the OpenSearch objects untouched; legacy child deletion is harmless; new CRs are editable/deletable; scale down/up (PVC reuse) and rolling restart work; `legacyAPI.enabled=false` after cleanup restarts nothing. The twin-state and OpenSearch-object checks are non-blocking while N31/N33 (FINDINGS-round5) stand |
+| `54-migration-edge-states` | Operator **2.8.0**: an emptyDir cluster migrates under live indexing without tripping emptyDir recovery; a cluster caught mid-OpenSearch-upgrade (Upgrader `Upgrading`, one node already on the new version) must be adopted and the upgrade finished by the new operator |
+| `55-migration-custom-tls` | Operator **2.8.0** with user-provided cert-manager certificates (`generate: false`): migration generates no secrets of its own, nodes keep serving the custom certs, rolling restart and major upgrade work, deleting the legacy CR leaves the cluster untouched |
+| `61-managed-resources-crds` | OpensearchRole/User/UserRoleBinding/Tenant/ActionGroup, OpenSearchISMPolicy, OpensearchComponentTemplate/IndexTemplate: CREATED and present in OpenSearch, updates and password rotation pushed, survive a rolling restart, a pre-existing unmanaged user is refused, deletion removes the OpenSearch objects, a namespace deleted with live child CRs finishes terminating |
 | `60-cluster-state-survives` | Index template, ISM policy + managed index, persistent setting and internal user created via REST survive a rolling restart (`additionalConfig` change) and an upgrade; the user still authenticates |
 | `64-snapshot-repository` | `general.snapshotRepositories` registers an fs repo (1 node, emptyDir + `path.repo`) that can snapshot and restore; settings changes are pushed; removing the entry keeps the repo (documented) |
 | `65-tls-custom-certs` | User-provided cert-manager certificates (transport, HTTP, admin client cert) with `generate: false`; the operator mounts them, generates nothing of its own, serves the custom HTTP cert |
-| `66-volumes-keystore-config` | `additionalVolumes` (configMap/secret), `keystore` with `keyMappings`, per-pool `additionalConfig` are visible inside the pods; a changed volume with `restartPods` rolls the pool |
+| `66-volumes-keystore-config` | `additionalVolumes` (configMap/secret), `keystore` with `keyMappings`, per-pool `additionalConfig`, `env`, `initContainers`, `sidecarContainers`, `hostAliases` are visible inside the pods; a changed volume with `restartPods` rolls the pool |
 | `67-nodepool-scheduling-pdb` | `nodeSelector`, tolerations, labels/annotations, `topologySpreadConstraints`, `affinity`, `pdb` reach pods and PDBs; invalid pdb (both fields) yields a Warning event and is skipped |
 | `68-custom-image-pinned` | Pinned `general.image`: version-only change denied by the webhook; image + version change rolls pods with the documented "custom image is pinned" Warning and no Upgrader run |
 | `69-version-validation` | 2.x -> 4.0.0 and downgrades refused by the reconciler (Warning/Upgrade event), cluster and `status.version` untouched, operator keeps reconciling, valid upgrade works after revert |
@@ -65,7 +72,7 @@ On failure the harness always dumps operator logs, the CR, pods, PVCs, events an
 | `73-emptydir-persistence` | `persistence.emptyDir` pool has no PVCs; a deleted pod comes back empty and data is recovered from replicas |
 | `74-emptydir-total-loss` | All emptyDir pods force-deleted: `EmptyDirRecovery` event after the grace period, cluster recreated and RUNNING/green |
 | `75-disk-resize` | `diskSize` change on a non-expandable storage class: PVC resize attempted, `Failed to Resize` Warning, pods keep running, data intact, revert settles (expansion itself needs `allowVolumeExpansion`) |
-| `76-deletion-semantics` | PVCs retained on delete and reused by a same-name cluster (data back); delete mid-upgrade completes; namespace deletion not blocked by finalizers |
+| `76-deletion-semantics` | PVCs retained on delete and reused by a same-name cluster (data back); delete mid-upgrade completes; a CR deleted while the operator is down is finished when it returns; namespace deletion not blocked by finalizers |
 | `77-dashboards` | Dashboards `additionalConfig` reaches `opensearch_dashboards.yml`; `dashboards.version` change is a rolling Deployment update with 0 pods unavailable |
 | `78-monitoring` | `monitoring.enable` installs `prometheus-exporter` on every node, `/_prometheus/metrics` serves; without prometheus-operator CRDs the ServiceMonitor is skipped with a Warning |
 | `79-security-disabled` | `security.tls.http.enabled: false` disables the security plugin: `plugins.security.disabled` in opensearch.yml, no securityconfig job, plain HTTP without credentials |
@@ -112,16 +119,18 @@ randomised per run unless set in `config`.
 ### Actions
 
 - **Lifecycle**: `setup_cluster`, `install_operator` (Helm; `version: local` builds the image from source, tags it
-  by git sha, imports it into k3d/kind and installs the local chart), `deploy_cluster` (`version`, `node_pools`,
+  by git sha, imports it into k3d/kind and installs the local chart; `build_ref: v2.3.2` builds an old operator from a git tag
+  and runs it under the published chart of that `version`, for operators whose images no longer exist), `deploy_cluster` (`version`, `node_pools`,
   `plugins`, `cluster_settings`, `dashboards`, `storage_class`, `extra_spec` for anything else in the CR spec),
-  `delete_cluster`, `cleanup_cluster`, `set_api_group`
+  `delete_cluster`, `cleanup_cluster`, `set_api_group` (waits up to `timeout` for the CR under the new group)
 - **Data**: `index_documents` (deterministic `_id`s, optional `duration` for sustained load), `query_documents`,
   `validate_data_integrity` (count + random sample of documents fetched by id)
 - **Validation**: `wait_for_cluster_ready`, `validate_cluster_health`, `validate_cluster_version`,
   `validate_cluster_configuration` (roles, plugins, settings, coordinator nodes, CR topology),
   `validate_node_configuration`, `validate_dashboards`, `validate_operator_status` (no restarts, no panics)
-- **Change**: `upgrade_cluster`, `upgrade_operator`, `scale_cluster`, `add_node_pool`, `remove_node_pool`
-- **Chaos**: `inject_pod_failure` (`delete` | `force_delete` | `kill`, `target: master`), `kill_operator`,
+- **Change**: `upgrade_cluster`, `upgrade_operator` (`expect_restart: true|false|any`, `wait_running: false` when the cluster is
+  deliberately not RUNNING, `legacy_api`), `scale_cluster`, `add_node_pool`, `remove_node_pool`
+- **Chaos**: `inject_pod_failure` (`delete` | `force_delete` | `delete_with_pvc` | `kill`, `target: master`), `kill_operator`, `scale_operator`,
   `inject_node_failure` (stops the k3d/kind node container); all take `delay` so they can strike mid-operation when run
   with `background: true`
 - **Diagnostics**: `collect_logs`, `debug_pause`, `update_cluster_settings` (explicit, never used to mask operator bugs)
@@ -129,10 +138,10 @@ randomised per run unless set in `config`.
   `wait_condition`), `check_opensearch_api` (any REST call, optionally as another `user`; asserts `status`, `expect`
   dotted paths, `contains`/`absent`; polls until it matches), `check_k8s_resource` (`kind` + `name`/`component`/`selector`,
   `expect` dotted paths, `exists: false`, `min_count`), `check_pod_exec` (run a command in the pods, assert output),
-  `expect_event` (Kubernetes event by `reason`/`type`/`contains`), `patch_cluster` (merge `patch`, `node_pool`
+  `expect_event` (Kubernetes event by `reason`/`type`/`contains`; `absent: true` proves it never appears within `timeout`), `patch_cluster` (merge `patch`, `node_pool`
   read-modify-write, `remove` paths, `wait_phase`, `wait_running`), `expect_rejected` (a `patch`/`node_pool`/
   `cluster_params`/`manifest` must be denied by the webhook with `message`; the CR must be unchanged),
-  `delete_namespace`, `delete_cluster_check_pvcs`, `wait_dashboards_version` (rolling update with `max_unavailable`).
+  `delete_resource` (any object, e.g. a legacy CR; `expect_pods_untouched`), `delete_namespace`, `delete_cluster_check_pvcs`, `wait_dashboards_version` (rolling update with `max_unavailable`).
   Manifests, names and paths may use `__CLUSTER__` / `__NAMESPACE__` placeholders (the names are random per run).
 - **Regression checks** (`actions/regressions.py`): `scale_cluster_managers` (manager pool scale under the observer, fails fast
   when the API is unreachable > `max_unreachable`, then checks the voting configuration), `check_voting_config`,

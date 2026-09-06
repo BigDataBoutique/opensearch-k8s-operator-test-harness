@@ -29,8 +29,8 @@ nohup bash -c "poetry run oko-test -v --log-file logs/run-$pb.log run playbooks/
 nohup scripts/run-lane.sh A playbooks/12-coordinator-nodes.yaml playbooks/20-upgrade-minor-2x.yaml >/dev/null 2>&1 &
 ```
 
-Concurrency: **at most 2 playbooks at a time** on a laptop-class box (three clusters booting at once pushed IO pressure above 50% and made containerd miss stop deadlines); the operator-upgrade playbook (`50-*`)
-must run **alone** (it replaces the shared operator). Every playbook uses its own random namespace and cluster
+Concurrency: **at most 2 playbooks at a time** on a laptop-class box (three clusters booting at once pushed IO pressure above 50% and made containerd miss stop deadlines); the operator-upgrade / migration playbooks (`50-*` to `55-*`)
+must run **alone** (they replace the shared operator with a released 2.x chart and upgrade it back to the local build). Every playbook uses its own random namespace and cluster
 name, and `install_operator` is idempotent, so lanes can share the k3d cluster and the operator.
 
 Typical durations when images are cached and IO is quiet: basic playbooks 2-3 min, upgrades 10-20 min,
@@ -107,8 +107,28 @@ observed *during* the operation; a violation there is the signal that matters fo
 | `helm uninstall` (or the harness replacing the operator) hangs for 5 min and the namespace stays `Terminating` | The chart templates its CRDs without a keep policy; a leftover CR with the operator's finalizer deadlocks the CRD deletion once the operator is gone (N23/N25) | Never replace the operator while OpenSearchCluster objects exist (`install_operator` refuses); to unstick: `kubectl patch opensearchclusters.<group> <name> -n <ns> --type=merge -p '{"metadata":{"finalizers":[]}}'`. |
 | First bulk request after `wait_for_cluster_ready` hangs / times out on a fresh cluster | The bootstrap pod was still a cluster member (often the elected manager) and left seconds later | `wait_for_cluster_ready` now also requires `number_of_nodes` == sum of pool replicas. |
 | Every scale-down is followed by a rolling restart of the whole pool, and the next step hits a 503 on the primary being killed | Operator bug: `last-applied` annotation on the pod template encodes `spec.replicas` (FINDINGS-round3 N29) | Scaling actions wait 20 s and re-wait for RUNNING after the Scaler finishes; `90` is expected to fail on the one-member-at-a-time invariant until N29 is fixed. |
+| Dashboards never ready under an operator <= 2.8 (`Startup probe failed: 503`, log `[ResponseError]`) while the same spec works on 3.x | The harness securityconfig defined no `kibanaserver` internal user; the 3.x operator tolerates that, older operators do not | `create_security_secrets` now defines `kibanaserver` (same password as admin) in `internal_users.yml`. |
+| A migrated cluster has lost every REST/Dashboards-created user, role or tenant after the operator upgrade | Operator finding N31 (FINDINGS-round5): adoption re-runs the securityconfig job with the full initial config | Expected while unfixed; `52` asserts it with `continue_on_error`. Not a harness problem. |
+| `validate_cluster_configuration` right after `wait_for_cluster_ready` on a **2.x** operator reports one node fewer than the CR (a pod is restarting) | 2.x operators roll every pod once after bootstrap without exposing an in-flight component status, so `wait_cluster_running` returns before the roll | `validate_cluster_configuration` polls its expectations for up to 3 min instead of judging one sample. |
+| `validate_operator_status` reports one operator restart; `kubectl logs --previous` ends with `failed to renew lease ... context deadline exceeded` / `leader election lost` | The API server answered a lease renewal slower than controller-runtime's 5 s deadline while two playbooks rolled pods at once (IO pressure); the manager exits by design and is restarted | Environment, not an operator finding (an operator with a longer `RenewDeadline` would ride it out). Rerun the playbook, or its remaining phases as an ad-hoc playbook with a fixed `namespace`/`cluster_name` on the leftover cluster. |
 | Unit test `test_observer_thread_stops_cleanly` fails only inside the full pytest run | Observer sample was inside a slow `kubectl` call when `stop()` joined with a 3 s timeout | `stop()` joins for up to 30 s. |
-| Two Dashboards replicas never become ready (`Another OpenSearch Dashboards instance appears to be migrating the index`) | Operator rolls the Deployment 1 s after creation (N27), three pods race the `.kibana_1` migration | Operator finding; rerun the playbook or use 1 replica if you only need Dashboards up. |
+| Dashboards replicas never become ready (`Another OpenSearch Dashboards instance appears to be migrating the index`) | Operator rolls the Deployment 1 s after creation (N27), the resulting pods race the `.kibana_1` migration | Operator finding; **`replicas: 1` is not a workaround** (round-4 `10-basic-3x` hit the same double-ReplicaSet livelock with a single-replica Dashboards spec) — just rerun the playbook. |
+| Suite runs go yellow-to-broken after several hours: k3d nodes flap `NotReady`, `cert-manager`/the operator pod itself start `CrashLoopBackOff` on liveness/readiness timeouts, and playbooks fail with "no endpoints available for service" on a webhook | `/proc/pressure/io` saturates (`some` 80-95%+) because failed playbooks' namespaces (`cleanup_on_failure: false`) accumulate for hours with their OpenSearch clusters still running/indexing; nothing purges them mid-suite | Not an operator bug. Run `poetry run oko-test cleanup` periodically during a long suite (or split it into shorter batches) once failure evidence for each namespace has been collected; `50`/`51` will also correctly refuse to run while any `OpenSearchCluster` objects exist (N23), which is itself a symptom of this pile-up, not a new finding. |
+
+## 4b. Migration playbooks (50-55)
+
+- `52` needs operator **2.3.2**, whose image was deleted from every registry (the `opsterio` ECR repo is gone, Docker Hub starts at 2.5.0):
+  `install_operator {version: 2.3.2, build_ref: v2.3.2}` builds `opensearch-operator:v2.3.2` from the git tag in `../opensearch-k8s-operator`
+  (plain `docker build`, ~3 min once) and runs it under the published 2.3.2 chart. Two more registry casualties are worked around in the
+  playbook: chart 2.3.2's `gcr.io/kubebuilder/kube-rbac-proxy:v0.12.0` (same tag exists on `quay.io/brancz`) and the 2.3.2 default
+  init helper `public.ecr.aws/opsterio/busybox` (`initHelper.image: busybox:1.36`).
+- **2.8.1 cannot be tested**: no `opensearch-operator:2.8.1` image exists and the 2.8.1/2.8.2 charts always pass `--enable-webhooks`
+  to the 2.8.0 binary, which rejects the flag (FINDINGS-round3 N22). No user can be running it, so `OPERATOR_PREV` stays 2.8.0.
+- Every legacy cluster the harness writes uses `dashboards.replicas: 1` (N25) except `50`, which documents the `replicas: 0` blocker.
+- `53` ends by upgrading the operator with `legacyAPI.enabled=false` and then back to `true`; if it fails in between, the shared
+  operator is left without the legacy CRDs/webhooks (`70` then fails its `legacy_api_group` phase): rerun `53` or
+  `install_operator {version: local, legacy_api: true}` from any playbook. `53` is therefore last in lane S3.
+- `54` runs a second cluster in the fixed namespace `oko-mig-b`; the playbook removes it before its last phase, `oko-test cleanup` removes it otherwise.
 
 ## 5. Version knobs
 
@@ -127,9 +147,9 @@ helm search repo opensearch-operator --versions | head
 `nohup scripts/run-suite.sh >/dev/null 2>&1 &` runs everything below in one go (10 alone to build the operator image, two lanes, then 50 alone); results land in `logs/lane-S0..S3.txt`. Arm one monitor on those files (section 2). Manually:
 
 1. `10-basic-3x`, `11-basic-2x`, `12-coordinator-nodes` (fast smoke, run first)
-2. Lane A: `20-upgrade-minor-2x`, `22-upgrade-minor-3x`, `30-scaling`
-3. Lane B: `21-upgrade-major-2x-to-3x`, `23-upgrade-abort`, `40-chaos`, `41-upgrade-under-chaos`
-4. `50-operator-upgrade` alone at the end (installs the previous released operator, then upgrades to the local build)
+2. Lane A: `20-upgrade-minor-2x`, `22-upgrade-minor-3x`, `30-scaling`, `31-scale-and-upgrade-together`
+3. Lane B: `21-upgrade-major-2x-to-3x`, `23-upgrade-abort`, `40-chaos`, `41-upgrade-under-chaos`, `61-managed-resources-crds`
+4. `51`, `50`, `52`, `54`, `55`, `53` alone at the end (each installs a released 2.x operator, then upgrades to the local build; see 4b)
 
 Judge a failure by category: harness bug (fix and re-run), environment (section 4), or operator behaviour
 (collect `logs/<pb>-<ts>/`, the observer summary, and the CR status; that is the finding to report).

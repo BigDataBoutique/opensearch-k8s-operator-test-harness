@@ -1,0 +1,282 @@
+metadata:
+  description: "The operator's own resource CRDs on a 3.x cluster: OpensearchRole, OpensearchUser (passwordFrom), OpensearchUserRoleBinding, OpensearchTenant, OpensearchActionGroup, OpenSearchISMPolicy (applied to matching indices), OpensearchComponentTemplate and OpensearchIndexTemplate reach CREATED and exist in OpenSearch; a spec change is pushed; a password rotation in the secret re-authenticates; everything survives a rolling restart; a CR for a pre-existing unmanaged user is refused instead of hijacked; deleting the CRs removes the OpenSearch objects (role mapping merged by the binding is cleaned up); the cluster stays RUNNING"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: apply_resource
+        params:
+          manifest: {apiVersion: v1, kind: Secret, metadata: {name: app-user-password}, stringData: {password: "AppUser123!"}}
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 1000, shards: 3, replicas: 1}
+      - action: index_documents
+        params: {index: ism-2026, count: 200, shards: 1, replicas: 1}
+
+  - name: create
+    steps:
+      - action: apply_resource
+        params:
+          manifest:
+            apiVersion: opensearch.org/v1
+            kind: OpensearchActionGroup
+            metadata: {name: app-actions}
+            spec: {opensearchCluster: {name: __CLUSTER__}, allowedActions: ["indices:data/read/search", "indices:data/read/get"], type: index, description: app read actions}
+      - action: apply_resource
+        params:
+          manifest:
+            apiVersion: opensearch.org/v1
+            kind: OpensearchRole
+            metadata: {name: app-role}
+            spec:
+              opensearchCluster: {name: __CLUSTER__}
+              clusterPermissions: [cluster_composite_ops]
+              indexPermissions: [{indexPatterns: ["data-*"], allowedActions: [app-actions]}]
+      - action: apply_resource
+        params:
+          manifest:
+            apiVersion: opensearch.org/v1
+            kind: OpensearchUser
+            metadata: {name: app-user}
+            spec:
+              opensearchCluster: {name: __CLUSTER__}
+              passwordFrom: {name: app-user-password, key: password}
+              backendRoles: [app-backend]
+              attributes: {team: oko}
+      - action: apply_resource
+        params:
+          manifest:
+            apiVersion: opensearch.org/v1
+            kind: OpensearchUserRoleBinding
+            metadata: {name: app-binding}
+            spec: {opensearchCluster: {name: __CLUSTER__}, users: [app-user], roles: [app-role]}
+      - action: apply_resource
+        params:
+          manifest:
+            apiVersion: opensearch.org/v1
+            kind: OpensearchTenant
+            metadata: {name: app-tenant}
+            spec: {opensearchCluster: {name: __CLUSTER__}, description: app tenant}
+      - action: apply_resource
+        params:
+          manifest:
+            apiVersion: opensearch.org/v1
+            kind: OpenSearchISMPolicy
+            metadata: {name: app-policy}
+            spec:
+              opensearchCluster: {name: __CLUSTER__}
+              description: app policy
+              defaultState: hot
+              applyToExistingIndices: true
+              ismTemplate: {indexPatterns: ["ism-*"], priority: 10}
+              states: [{name: hot, actions: [{replicaCount: {numberOfReplicas: 1}}], transitions: []}]
+      - action: apply_resource
+        params:
+          manifest:
+            apiVersion: opensearch.org/v1
+            kind: OpensearchComponentTemplate
+            metadata: {name: app-component}
+            spec:
+              opensearchCluster: {name: __CLUSTER__}
+              template: {settings: {number_of_shards: 1, number_of_replicas: 1}, mappings: {properties: {level: {type: keyword}}}}
+      - action: apply_resource
+        params:
+          manifest:
+            apiVersion: opensearch.org/v1
+            kind: OpensearchIndexTemplate
+            metadata: {name: app-template}
+            spec:
+              opensearchCluster: {name: __CLUSTER__}
+              indexPatterns: ["app-logs-*"]
+              composedOf: [app-component]
+              priority: 100
+      - action: check_k8s_resource
+        params: {kind: opensearchactiongroups.opensearch.org, name: app-actions, expect: {status.state: CREATED}, timeout: 5m}
+      - action: check_k8s_resource
+        params: {kind: opensearchroles.opensearch.org, name: app-role, expect: {status.state: CREATED}, timeout: 5m}
+      - action: check_k8s_resource
+        params: {kind: opensearchusers.opensearch.org, name: app-user, expect: {status.state: CREATED}, timeout: 5m}
+      - action: check_k8s_resource
+        params: {kind: opensearchuserrolebindings.opensearch.org, name: app-binding, expect: {status.state: CREATED}, timeout: 5m}
+      - action: check_k8s_resource
+        params: {kind: opensearchtenants.opensearch.org, name: app-tenant, expect: {status.state: CREATED}, timeout: 5m}
+      - action: check_k8s_resource
+        params: {kind: opensearchismpolicies.opensearch.org, name: app-policy, expect: {status.state: CREATED}, timeout: 5m}
+      - action: check_k8s_resource
+        params: {kind: opensearchcomponenttemplates.opensearch.org, name: app-component, expect: {status.state: CREATED}, timeout: 5m}
+      - action: check_k8s_resource
+        params: {kind: opensearchindextemplates.opensearch.org, name: app-template, expect: {status.state: CREATED}, timeout: 5m}
+
+  - name: verify_in_opensearch
+    steps:
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/authinfo, user: {username: app-user, password: "AppUser123!"}, expect: {user_name: app-user, backend_roles: [app-backend], roles: [app-role]}}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/api/internalusers/app-user, expect: {app-user.attributes.team: oko}}
+      # the role works end to end: search allowed on data-*, anything else denied
+      - action: check_opensearch_api
+        params: {path: "/data-a/_search?size=1", user: {username: app-user, password: "AppUser123!"}, expect: {hits.total.value: 1000}}
+      - action: check_opensearch_api
+        params: {path: /data-a/_doc/oko-forbidden, method: PUT, body: {x: 1}, status: 403, user: {username: app-user, password: "AppUser123!"}}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/api/actiongroups/app-actions, expect: {app-actions.allowed_actions: ["indices:data/read/search"]}}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/api/tenants/app-tenant, expect: {app-tenant.description: app tenant}}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_ism/policies/app-policy, expect: {policy.default_state: hot}}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_ism/explain/ism-2026, expect: {total_managed_indices: 1}, contains: ["app-policy"]}
+      - action: check_opensearch_api
+        params: {path: /app-logs-2026, method: PUT}
+      - action: check_opensearch_api
+        params: {path: /app-logs-2026/_mapping, expect: {"app-logs-2026.mappings.properties.level.type": keyword}}
+
+  - name: update
+    steps:
+      - action: apply_resource
+        params:
+          manifest:
+            apiVersion: opensearch.org/v1
+            kind: OpensearchRole
+            metadata: {name: app-role}
+            spec:
+              opensearchCluster: {name: __CLUSTER__}
+              clusterPermissions: [cluster_composite_ops, cluster_monitor]
+              indexPermissions: [{indexPatterns: ["data-*"], allowedActions: [app-actions, index]}]
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/api/roles/app-role, expect: {app-role.cluster_permissions: [cluster_composite_ops, cluster_monitor]}}
+      - action: check_opensearch_api
+        params: {path: /data-a/_doc/oko-allowed-now, method: PUT, body: {x: 1}, status: 201, user: {username: app-user, password: "AppUser123!"}}
+      - action: patch_secret
+        params: {name: app-user-password, data: {password: "AppUser456!"}}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/authinfo, user: {username: app-user, password: "AppUser456!"}, expect: {user_name: app-user}, timeout: 5m}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/authinfo, status: 401, user: {username: app-user, password: "AppUser123!"}}
+      - action: apply_resource
+        params:
+          manifest:
+            apiVersion: opensearch.org/v1
+            kind: OpensearchIndexTemplate
+            metadata: {name: app-template}
+            spec:
+              opensearchCluster: {name: __CLUSTER__}
+              indexPatterns: ["app-logs-*", "app-metrics-*"]
+              composedOf: [app-component]
+              priority: 200
+      - action: check_opensearch_api
+        params: {path: /_index_template/app-template, expect: {index_templates: [{name: app-template, index_template: {index_patterns: ["app-logs-*", "app-metrics-*"], priority: 200}}]}}
+
+  - name: unmanaged_user_is_not_hijacked
+    steps:
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/api/internalusers/manual-user, method: PUT, status: 201, body: {password: "ManualUser123!"}}
+      - action: apply_resource
+        params:
+          manifest:
+            apiVersion: opensearch.org/v1
+            kind: OpensearchUser
+            metadata: {name: manual-user}
+            spec: {opensearchCluster: {name: __CLUSTER__}, passwordFrom: {name: app-user-password, key: password}}
+      - action: check_k8s_resource
+        params: {kind: opensearchusers.opensearch.org, name: manual-user, expect: {status.state: ERROR}, timeout: 5m}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/authinfo, user: {username: manual-user, password: "ManualUser123!"}, expect: {user_name: manual-user}}
+      - action: delete_resource
+        params: {kind: opensearchusers.opensearch.org, name: manual-user}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/authinfo, user: {username: manual-user, password: "ManualUser123!"}, expect: {user_name: manual-user}}
+
+  - name: survive_rolling_restart
+    steps:
+      - action: rolling_restart
+        params: {patch: {spec: {general: {additionalConfig: {"http.max_content_length": "150mb"}}}}, max_unready_pods: 1, min_health: yellow}
+      - action: wait_for_cluster_ready
+      - action: check_k8s_resource
+        params: {kind: opensearchusers.opensearch.org, name: app-user, expect: {status.state: CREATED}}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/authinfo, user: {username: app-user, password: "AppUser456!"}, expect: {user_name: app-user, roles: [app-role]}}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_ism/explain/ism-2026, expect: {total_managed_indices: 1}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 1001}
+
+  - name: delete
+    steps:
+      - action: delete_resource
+        params: {kind: opensearchuserrolebindings.opensearch.org, name: app-binding}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/authinfo, user: {username: app-user, password: "AppUser456!"}, expect: {user_name: app-user}, absent: ["app-role"], timeout: 5m}
+      - action: delete_resource
+        params: {kind: opensearchusers.opensearch.org, name: app-user}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/authinfo, status: 401, user: {username: app-user, password: "AppUser456!"}, timeout: 5m}
+      - action: delete_resource
+        params: {kind: opensearchroles.opensearch.org, name: app-role}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/api/roles/app-role, status: 404, timeout: 5m}
+      - action: delete_resource
+        params: {kind: opensearchactiongroups.opensearch.org, name: app-actions}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/api/actiongroups/app-actions, status: 404, timeout: 5m}
+      - action: delete_resource
+        params: {kind: opensearchtenants.opensearch.org, name: app-tenant}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/api/tenants/app-tenant, status: 404, timeout: 5m}
+      - action: delete_resource
+        params: {kind: opensearchindextemplates.opensearch.org, name: app-template}
+      - action: check_opensearch_api
+        params: {path: /_index_template/app-template, status: 404, timeout: 5m}
+      - action: delete_resource
+        params: {kind: opensearchcomponenttemplates.opensearch.org, name: app-component}
+      - action: check_opensearch_api
+        params: {path: /_component_template/app-component, status: 404, timeout: 5m}
+      - action: delete_resource
+        params: {kind: opensearchismpolicies.opensearch.org, name: app-policy}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_ism/policies/app-policy, status: 404, timeout: 5m}
+      - action: wait_for_cluster_ready
+      - action: validate_operator_status
+
+  - name: namespace_deletion_with_live_resources
+    description: "The whole namespace is deleted while child CRs still exist: their finalizers must be released even though the cluster they refer to disappears at the same time (no Terminating namespace, FINDINGS-round5 N34)"
+    steps:
+      - action: apply_resource
+        params:
+          manifest:
+            apiVersion: opensearch.org/v1
+            kind: OpensearchRole
+            metadata: {name: last-role}
+            spec: {opensearchCluster: {name: __CLUSTER__}, clusterPermissions: [cluster_monitor], indexPermissions: [{indexPatterns: ["data-*"], allowedActions: [read]}]}
+      - action: apply_resource
+        params:
+          manifest:
+            apiVersion: opensearch.org/v1
+            kind: OpensearchUser
+            metadata: {name: last-user}
+            spec: {opensearchCluster: {name: __CLUSTER__}, passwordFrom: {name: app-user-password, key: password}}
+      - action: apply_resource
+        params:
+          manifest:
+            apiVersion: opensearch.org/v1
+            kind: OpensearchTenant
+            metadata: {name: last-tenant}
+            spec: {opensearchCluster: {name: __CLUSTER__}, description: last tenant}
+      - action: check_k8s_resource
+        params: {kind: opensearchusers.opensearch.org, name: last-user, expect: {status.state: CREATED}, timeout: 5m}
+      - action: check_k8s_resource
+        params: {kind: opensearchtenants.opensearch.org, name: last-tenant, expect: {status.state: CREATED}, timeout: 5m}
+      - action: delete_namespace
+        params: {timeout: 10m}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

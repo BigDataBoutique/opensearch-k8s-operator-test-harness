@@ -1,0 +1,66 @@
+metadata:
+  description: "A version bump and a data-pool scale-up land in the same reconcile window (two spec changes seconds apart, the way a single edited manifest is applied). The operator must serialise the Upgrader and the Scaler instead of interleaving them: never more than one pod down at a time, health >= yellow under live indexing, both changes applied (every node on the new version, 3 data nodes), allocation settings restored, RUNNING with no dangling component status"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X_OLD:-3.0.0}"
+          extra_spec: {confMgmt: {smartScaler: true}}
+          node_pools:
+            - {component: masters, replicas: 3, roles: ["cluster_manager"]}
+            - {component: data, replicas: 2, roles: ["data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 4000, shards: 4, replicas: 1}
+
+  - name: upgrade_and_scale_up_together
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 15m, min_success_ratio: 0.9}
+      - action: scale_cluster
+        background: true
+        params: {component: data, replicas: 3, min_health: yellow, max_unready_pods: 1, timeout: 30m}
+      - action: upgrade_cluster
+        params: {target_version: "${OS_VERSION_3X:-3.8.0}", max_unready_pods: 1, min_health: yellow, timeout: 30m}
+
+  - name: verify
+    steps:
+      - action: wait_for_cluster_ready
+        params: {expect_version: "${OS_VERSION_3X:-3.8.0}"}
+      - action: validate_cluster_version
+        params: {expected_version: "${OS_VERSION_3X:-3.8.0}"}
+      - action: validate_cluster_configuration
+        params: {total_nodes: 6, roles: {cluster_manager: 3, data: 3}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 4000}
+      - action: query_documents
+        params: {index: data-live, expected_min_count: 5000}
+      - action: validate_node_configuration
+      - action: validate_operator_status
+
+  - name: scale_down_and_upgrade_together
+    description: "The reverse order on a busier cluster: a scale-down (drain) is requested moments before a config change. The drained node must not be taken as the rolling-restart candidate while it still holds shards, and the removal must not coincide with another pod going down. EXPECTED TO FAIL while round-3 N29 stands: the scale-down itself starts a whole-pool restart and the removed node's neighbour is killed one second after it (6 -> 4 members)."
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live2, count: 200, replicas: 1, duration: 15m, min_success_ratio: 0.9}
+      - action: scale_cluster
+        background: true
+        params: {component: data, replicas: 2, min_health: yellow, max_unready_pods: 1, timeout: 30m}
+      - action: rolling_restart
+        params: {patch: {spec: {general: {additionalConfig: {"http.max_content_length": "150mb"}}}}, max_unready_pods: 1, min_health: yellow, timeout: 30m}
+      - action: wait_for_cluster_ready
+      - action: validate_cluster_configuration
+        params: {total_nodes: 5, roles: {cluster_manager: 3, data: 2}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 4000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

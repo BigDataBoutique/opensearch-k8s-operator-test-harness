@@ -1,5 +1,5 @@
 metadata:
-  description: "Dedicated coordinator pool with roles: [] (operator issue #1023) routes requests and stores no data"
+  description: "Dedicated coordinator pool with roles: [] (operator issue #1023) routes requests and stores no data; a rolling upgrade of a cluster with a shard-less pool completes one pod at a time under live indexing"
 
 phases:
   - name: setup
@@ -8,6 +8,7 @@ phases:
       - action: install_operator
       - action: deploy_cluster
         params:
+          version: "${OS_VERSION_3X_OLD:-3.0.0}"
           node_pools:
             - component: nodes
               replicas: 3
@@ -29,6 +30,21 @@ phases:
         params: {index: data-a, count: 1000, shards: 3, replicas: 1}
       - action: validate_data_integrity
         params: {index: data-a, expected_documents: 1000}
+
+  - name: upgrade_with_coordinators
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 8m, min_success_ratio: 0.9}
+      - action: upgrade_cluster
+        params: {target_version: "${OS_VERSION_3X:-3.8.0}", max_unready_pods: 1, min_health: yellow}
+      - action: wait_for_cluster_ready
+        params: {expect_version: "${OS_VERSION_3X:-3.8.0}"}
+      - action: validate_cluster_configuration
+        params: {total_nodes: 4, roles: {cluster_manager: 3, data: 3, ingest: 3}, coordinator_nodes: 1}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 1000}
+      - action: validate_operator_status
 
   - name: teardown
     steps:

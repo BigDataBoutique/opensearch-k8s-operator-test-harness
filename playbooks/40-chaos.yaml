@@ -31,6 +31,19 @@ phases:
         params: {index: data-b, count: 1000, replicas: 1}
       - action: validate_operator_status
 
+  - name: disk_loss
+    description: "A node loses its disk: pod and PVC go together; the StatefulSet must bring the pod back on a fresh volume and the data must be recovered from replicas"
+    steps:
+      - action: inject_pod_failure
+        params: {count: 1, method: delete_with_pvc, min_health: yellow}
+      - action: wait_for_cluster_ready
+      - action: check_k8s_resource
+        params: {kind: pvc, selector: "opensearch.org/opensearch-cluster=__CLUSTER__", min_count: 3}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 5000}
+      - action: validate_data_integrity
+        params: {index: data-b, expected_documents: 1000}
+
   - name: node_outage
     steps:
       - action: index_documents

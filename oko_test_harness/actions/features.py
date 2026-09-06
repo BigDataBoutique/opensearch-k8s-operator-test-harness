@@ -10,7 +10,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from oko_test_harness import k8s
-from oko_test_harness.actions.base import BaseAction
+from oko_test_harness.actions.base import BaseAction, parse_duration
 from oko_test_harness.actions.cluster import DeployClusterAction
 from oko_test_harness.models.playbook import ActionResult
 from oko_test_harness.opensearch import OpenSearchClient
@@ -214,31 +214,40 @@ class ExpectEventAction(BaseAction):
     in its message; `type` restricts to Warning/Normal."""
 
     action_name = "expect_event"
-    params = {"reason", "contains", "type", "since"}
+    params = {"reason", "contains", "type", "since", "absent"}
 
     def execute(self, params):
         since = time.time() - self.timeout(params.get("since", "10m")) if params.get("since") else 0
-
-        def find():
-            import datetime
-
-            for e in k8s.get_json("events", "-n", self.namespace).get("items", []):
-                if params.get("reason") and e.get("reason") != params["reason"]:
-                    continue
-                if params.get("type") and e.get("type") != params["type"]:
-                    continue
-                if params.get("contains") and params["contains"] not in (e.get("message") or ""):
-                    continue
-                ts = e.get("lastTimestamp") or e.get("eventTime") or (e.get("series") or {}).get("lastObservedTime") or ""
-                if since and ts:
-                    when = datetime.datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc).timestamp()
-                    if when < since:
-                        continue
-                return e
-            raise Exception(f"no event reason={params.get('reason')} type={params.get('type')} containing {params.get('contains')!r}")
-
-        e = k8s.wait_for("event", find, self.timeout("5m"), 5)
+        if params.get("absent"):  # the event must NOT appear for the whole `timeout` (default 2m)
+            deadline = time.time() + self.timeout("2m")
+            while time.time() < deadline:
+                try:
+                    e = self._find(params, since)
+                    return ActionResult(False, f"Unexpected event {e.get('type')}/{e.get('reason')}: {(e.get('message') or '')[:200]}")
+                except Exception:  # noqa: BLE001 - not found
+                    time.sleep(10)
+            return ActionResult(True, f"No event reason={params.get('reason')} containing {params.get('contains')!r} appeared")
+        e = k8s.wait_for("event", lambda: self._find(params, since), self.timeout("5m"), 5)
         return ActionResult(True, f"Event {e.get('type')}/{e.get('reason')}: {(e.get('message') or '')[:200]}")
+
+    def _find(self, params, since):
+        import datetime
+
+        for e in k8s.get_json("events", "-n", self.namespace).get("items", []):
+            if params.get("reason") and e.get("reason") != params["reason"]:
+                continue
+            if params.get("type") and e.get("type") != params["type"]:
+                continue
+            if params.get("contains") and params["contains"] not in (e.get("message") or ""):
+                continue
+            ts = e.get("lastTimestamp") or e.get("eventTime") or (e.get("series") or {}).get("lastObservedTime") or ""
+            if since and ts:
+                when = datetime.datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc).timestamp()
+                if when < since:
+                    continue
+            return e
+        raise Exception(f"no event reason={params.get('reason')} type={params.get('type')} containing {params.get('contains')!r}")
+
 
 
 class PatchClusterAction(BaseAction):
@@ -342,6 +351,31 @@ class ExpectRejectedAction(BaseAction, _Placeholders):
             if after["spec"] != before["spec"]:
                 return ActionResult(False, f"{what} rejected but the CR spec changed anyway")
         return ActionResult(True, f"{what} rejected as expected: {err[-300:]}")
+
+
+class DeleteResourceAction(BaseAction, _Placeholders):
+    """Delete one Kubernetes object (`kind` + `name`, e.g. a legacy opensearchclusters.opensearch.opster.io CR after
+    migration) and wait for it to disappear (`wait_gone`, default true). `expect_pods_untouched: true` proves the
+    deletion had no effect on the OpenSearch pods (same UIDs after `settle`, default 90s)."""
+
+    action_name = "delete_resource"
+    params = {"kind", "name", "wait_gone", "expect_pods_untouched", "settle"}
+
+    def execute(self, params):
+        kind, name = params["kind"], self.sub(params["name"])
+        before = {p["name"]: p["uid"] for p in self.pods() if p["labels"].get(k8s.NODEPOOL_LABEL)}
+        k8s.kubectl("delete", kind, name, "-n", self.namespace, "--ignore-not-found", "--wait=false")
+        if params.get("wait_gone", True):
+            k8s.wait_for(f"{kind}/{name} gone", lambda: not k8s.get_json(kind, name, "-n", self.namespace), self.timeout("5m"), 5)
+        msg = f"Deleted {kind}/{name}"
+        if params.get("expect_pods_untouched"):
+            time.sleep(parse_duration(params.get("settle", "90s")))
+            after = {p["name"]: p["uid"] for p in self.pods() if p["labels"].get(k8s.NODEPOOL_LABEL)}
+            changed = sorted(n for n in before if after.get(n) != before[n])
+            if changed:
+                return ActionResult(False, f"{msg}, but pods were replaced or removed afterwards: {changed}")
+            msg += f"; {len(before)} pods untouched"
+        return ActionResult(True, msg)
 
 
 class DeleteNamespaceAction(BaseAction):

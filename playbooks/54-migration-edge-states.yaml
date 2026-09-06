@@ -1,0 +1,89 @@
+metadata:
+  description: "Two legacy 2.8.0 clusters in awkward states when the operator is upgraded. B (namespace oko-mig-b) uses emptyDir persistence under live indexing: the migration must not trip the emptyDir recovery (no 'Recreating emptyDir cluster' event, no document loss). A is in the middle of an OpenSearch upgrade (2.18 -> 2.19, Upgrader component Upgrading; the 2.x operator keeps phase RUNNING meanwhile, so the migration controller's RUNNING-only rule does not hold it back) when the 2.x operator is replaced: the new operator must adopt the half-upgraded cluster (status.version 2.18.0, spec 2.19.6, one node already on 2.19.6) and finish the upgrade one node at a time with no document loss"
+
+config:
+  opensearch:
+    api_group: "opensearch.opster.io"
+
+phases:
+  - name: setup_with_operator_2_8
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+        params: {version: "${OPERATOR_PREV:-2.8.0}", values: {"kubeRbacProxy.enable": "false"}}
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_2X_OLD:-2.18.0}"
+          dashboards: {enabled: false, replicas: 1}  # N25 sidestep, see playbook 50
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: deploy_cluster
+        params:
+          namespace: oko-mig-b
+          cluster_name: os-mig-b
+          version: "${OS_VERSION_2X:-2.19.6}"
+          dashboards: {enabled: false, replicas: 1}
+          extra_spec:
+            nodePools:
+              - component: nodes
+                replicas: 3
+                roles: ["cluster_manager", "data", "ingest"]
+                diskSize: 5Gi
+                resources: {requests: {cpu: 250m, memory: 1Gi}, limits: {cpu: "2", memory: 2Gi}}
+                jvm: "-Xmx768m -Xms768m"
+                persistence: {emptyDir: {}}
+      - action: wait_for_cluster_ready
+        params: {timeout: 30m}
+      - action: wait_for_cluster_ready
+        params: {namespace: oko-mig-b, cluster_name: os-mig-b, timeout: 30m}
+      - action: index_documents
+        params: {index: data-a, count: 2000, shards: 3, replicas: 1}
+      - action: index_documents
+        params: {namespace: oko-mig-b, cluster_name: os-mig-b, index: data-b, count: 2000, shards: 3, replicas: 1}
+      - action: patch_cluster
+        params: {patch: {spec: {general: {version: "${OS_VERSION_2X:-2.19.6}"}}}}
+      - action: check_k8s_resource
+        # the 2.x operator keeps phase RUNNING during an upgrade and only records it in componentsStatus
+        params: {kind: opensearchclusters.opensearch.opster.io, name: __CLUSTER__, expect: {status.componentsStatus: [{component: Upgrader, status: Upgrading}]}, timeout: 5m}
+
+  - name: operator_upgrade
+    steps:
+      - action: index_documents
+        background: true
+        params: {namespace: oko-mig-b, cluster_name: os-mig-b, index: data-live-b, count: 200, replicas: 1, duration: 10m, min_success_ratio: 0.9}
+      - action: upgrade_operator
+        params: {version: local, expect_restart: any, wait_running: false, timeout: 20m}
+
+  - name: emptydir_cluster_migrates_without_recovery
+    steps:
+      - action: set_api_group
+        params: {namespace: oko-mig-b, cluster_name: os-mig-b, api_group: opensearch.org, timeout: 10m}
+      - action: wait_for_cluster_ready
+        params: {namespace: oko-mig-b, cluster_name: os-mig-b, timeout: 20m}
+      - action: expect_event
+        params: {namespace: oko-mig-b, reason: EmptyDirRecovery, absent: true, timeout: 3m}
+      - action: check_k8s_resource
+        params: {namespace: oko-mig-b, cluster_name: os-mig-b, kind: pvc, exists: false}
+      - action: validate_data_integrity
+        params: {namespace: oko-mig-b, cluster_name: os-mig-b, index: data-b, expected_documents: 2000}
+      - action: query_documents
+        params: {namespace: oko-mig-b, cluster_name: os-mig-b, index: data-live-b, expected_min_count: 2000}
+      - action: validate_operator_status
+      - action: delete_cluster
+        params: {namespace: oko-mig-b, cluster_name: os-mig-b, delete_namespace: true}  # B is done; free its namespace before the last phase (a failure there would leave it behind)
+
+  - name: mid_upgrade_cluster_is_adopted
+    steps:
+      - action: set_api_group
+        params: {api_group: opensearch.org, timeout: 15m}
+      - action: wait_for_cluster_ready
+        params: {expect_version: "${OS_VERSION_2X:-2.19.6}", timeout: 25m}
+      - action: validate_cluster_version
+        params: {expected_version: "${OS_VERSION_2X:-2.19.6}"}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

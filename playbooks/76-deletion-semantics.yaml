@@ -1,5 +1,5 @@
 metadata:
-  description: "Deleting a cluster retains its PVCs and a re-created cluster with the same name recovers the data from them; deleting the CR in the middle of an upgrade completes; deleting the namespace directly is not blocked by operator finalizers"
+  description: "Deleting a cluster retains its PVCs and a re-created cluster with the same name recovers the data from them; deleting the CR in the middle of an upgrade completes; a CR deleted while the operator is down is finished by the operator when it returns; deleting the namespace directly is not blocked by operator finalizers"
 
 phases:
   - name: setup
@@ -38,6 +38,29 @@ phases:
         params: {timeout: 10m}
       - action: check_k8s_resource
         params: {kind: statefulset, exists: false, selector: "opensearch.org/opensearch-cluster=__CLUSTER__"}
+      - action: validate_operator_status
+
+  - name: delete_while_operator_down
+    description: "The CR is deleted while the operator is scaled to zero; the finalizer must hold, and the returned operator must finish the deletion (no deadlock, no orphaned pods)"
+    steps:
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: scale_operator
+        params: {replicas: 0}
+      - action: delete_resource
+        params: {kind: opensearchclusters.opensearch.org, name: __CLUSTER__, wait_gone: false}
+      - action: check_k8s_resource
+        params: {kind: opensearchclusters.opensearch.org, name: __CLUSTER__, expect: {metadata.finalizers: [Opensearch]}}
+      - action: scale_operator
+        params: {replicas: 1}
+      - action: check_k8s_resource
+        params: {kind: opensearchclusters.opensearch.org, name: __CLUSTER__, exists: false, timeout: 10m}
+      - action: check_k8s_resource
+        params: {kind: pod, component: nodes, exists: false, timeout: 5m}
       - action: validate_operator_status
 
   - name: namespace_deletion

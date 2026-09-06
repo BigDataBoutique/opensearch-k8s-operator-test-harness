@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import subprocess
+import tempfile
 import time
 from typing import Any, Dict, List, Optional
 
@@ -84,7 +85,7 @@ class InstallOperatorAction(BaseAction):
     """Install or upgrade the operator with Helm. version 'local' builds the image from local_operator_path."""
 
     action_name = "install_operator"
-    params = {"version", "values", "values_file", "cert_manager", "legacy_api"}
+    params = {"version", "values", "values_file", "cert_manager", "legacy_api", "build_ref"}
 
     def execute(self, params):
         o = self.config.opensearch
@@ -128,15 +129,22 @@ class InstallOperatorAction(BaseAction):
             sh(["helm", "repo", "update", "opensearch-operator"])
             if installed_chart(o.operator_release, ns):
                 # uninstall deletes the CRDs; a leftover CR with the operator's finalizer would deadlock that (operator gone first)
-                leftovers = [f"{i['metadata']['namespace']}/{i['metadata']['name']}" for g in ("opensearch.org", "opensearch.opster.io") for i in (k8s.get_json(k8s.cluster_resource(g), "-A") or {}).get("items", [])]
+                leftovers = k8s.operator_crs()  # child CRs (users, roles, ...) carry finalizers too and deadlock the CRD deletion just the same
                 if leftovers:
-                    raise RuntimeError(f"cannot replace the operator while OpenSearchCluster objects exist: {leftovers}; this playbook must run alone")
+                    raise RuntimeError(f"cannot replace the operator while operator CRs exist: {leftovers}; this playbook must run alone (poetry run oko-test cleanup)")
                 # a released chart is the *starting point* of an upgrade scenario, so it is installed from scratch: helm's
                 # three-way merge from a different (or failed) release leaves resources such as the renamed Deployment untouched.
                 # Note: the operator chart templates its CRDs, so this deletes every OpenSearchCluster in the k8s cluster (N23).
                 logger.warning(f"Uninstalling existing release {o.operator_release} before installing chart {version}")
                 sh(["helm", "uninstall", o.operator_release, "-n", ns, "--wait", "--timeout", "5m"])
             cmd = ["helm", "upgrade", "--install", o.operator_release, "opensearch-operator/opensearch-operator", "--version", version, *common]
+            if params.get("build_ref"):
+                # released operator images older than 2.5.0 no longer exist in any registry (opsterio ECR repo is gone), so an
+                # old operator is built from its git tag in the local checkout and run under the published chart of that version
+                go_dir, _ = operator_dirs(o.local_operator_path)
+                image = build_operator_ref(go_dir, str(params["build_ref"]))
+                repo, tag = image.rsplit(":", 1)
+                cmd += ["--set", f"manager.image.repository={repo}", "--set", f"manager.image.tag={tag}", "--set", "manager.image.pullPolicy=IfNotPresent"]
         if "legacy_api" in params:
             cmd += ["--set", f"legacyAPI.enabled={'true' if params['legacy_api'] else 'false'}"]
         for key, val in (params.get("values") or {}).items():
@@ -231,6 +239,24 @@ def build_local_operator(go_dir: str, image: str) -> None:
     else:
         logger.info(f"Reusing already built operator image {image}")
     import_image_into_cluster(image)
+
+
+def build_operator_ref(go_dir: str, ref: str) -> str:
+    """Build opensearch-operator:<ref> from a git ref of the operator repo (temporary worktree, plain docker build:
+    old Makefiles need toolchains that no longer install) and load it into the cluster."""
+    image = f"opensearch-operator:{ref}"
+    if subprocess.run(["docker", "image", "inspect", image], capture_output=True).returncode != 0:
+        root = sh(["git", "rev-parse", "--show-toplevel"], cwd=go_dir).strip()
+        wt = os.path.join(tempfile.gettempdir(), f"oko-operator-{ref}")
+        subprocess.run(["git", "worktree", "remove", "--force", wt], cwd=root, capture_output=True)
+        sh(["git", "worktree", "add", "--detach", wt, ref], cwd=root)
+        try:
+            logger.info(f"Building operator image {image} from git ref {ref}")
+            sh(["docker", "build", "-t", image, "."], cwd=os.path.join(wt, os.path.relpath(go_dir, root)), timeout=1800)
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force", wt], cwd=root, capture_output=True)
+    import_image_into_cluster(image)
+    return image
 
 
 def import_image_into_cluster(image: str) -> None:
@@ -331,7 +357,9 @@ def create_security_secrets(namespace: str, username: str, password: str) -> Non
     pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()
     files = {
         "config.yml": "_meta:\n  type: config\n  config_version: 2\nconfig:\n  dynamic:\n    authc:\n      basic_internal_auth_domain:\n        http_enabled: true\n        transport_enabled: true\n        order: 4\n        http_authenticator:\n          type: basic\n          challenge: true\n        authentication_backend:\n          type: intern\n",
-        "internal_users.yml": f'_meta:\n  type: internalusers\n  config_version: 2\n{username}:\n  hash: "{pw_hash}"\n  reserved: true\n  backend_roles:\n  - admin\n',
+        # kibanaserver is the Dashboards service user (dashboards-credentials below); the 3.x operator adds it to a custom
+        # securityconfig itself, operators <= 2.8 do not, so the harness config is self-contained
+        "internal_users.yml": f'_meta:\n  type: internalusers\n  config_version: 2\n{username}:\n  hash: "{pw_hash}"\n  reserved: true\n  backend_roles:\n  - admin\nkibanaserver:\n  hash: "{pw_hash}"\n  reserved: true\n',
         "roles.yml": "_meta:\n  type: roles\n  config_version: 2\n",
         "roles_mapping.yml": f"_meta:\n  type: rolesmapping\n  config_version: 2\nall_access:\n  reserved: false\n  backend_roles:\n  - admin\n  users:\n  - {username}\nsecurity_rest_api_access:\n  reserved: false\n  backend_roles:\n  - admin\n  users:\n  - {username}\nkibana_server:\n  reserved: true\n  users:\n  - kibanaserver\n",
         "action_groups.yml": "_meta:\n  type: actiongroups\n  config_version: 2\n",
@@ -410,8 +438,9 @@ class SetApiGroupAction(BaseAction):
 
     def execute(self, params):
         self.config.opensearch.api_group = params["api_group"]
-        cr = k8s.get_cr(params["api_group"], self.cluster, self.namespace)
-        if not cr:
-            return ActionResult(False, f"No {k8s.cluster_resource(params['api_group'])} named {self.cluster} in {self.namespace}")
+        try:  # the migration controller creates the opensearch.org twin asynchronously (only once the legacy CR is RUNNING)
+            cr = k8s.wait_for(f"{k8s.cluster_resource(params['api_group'])}/{self.cluster}", lambda: k8s.get_cr(params["api_group"], self.cluster, self.namespace), self.timeout("30s"), 5)
+        except TimeoutError as e:
+            return ActionResult(False, f"No {k8s.cluster_resource(params['api_group'])} named {self.cluster} in {self.namespace}: {e}")
         ann = cr["metadata"].get("annotations", {})
         return ActionResult(True, f"Now using {params['api_group']}; CR phase {cr.get('status', {}).get('phase')}, migrated-from={ann.get('opensearch.org/migrated-from')}")

@@ -40,9 +40,14 @@ class InjectPodFailureAction(BaseAction):
                 k8s.delete_pod(self.namespace, p["name"], force=True)
             elif method == "kill":
                 self._sigkill(p)
+            elif method == "delete_with_pvc":  # a lost disk: the PVC goes with the pod, the StatefulSet provisions a fresh empty one
+                for pvc in k8s.get_json("pvc", "-n", self.namespace).get("items", []):
+                    if pvc["metadata"]["name"].endswith("-" + p["name"]):
+                        k8s.kubectl("delete", "pvc", pvc["metadata"]["name"], "-n", self.namespace, "--wait=false")
+                k8s.delete_pod(self.namespace, p["name"], force=True)
             else:
                 obs.stop()
-                return ActionResult(False, f"Unknown method {method}; use delete, force_delete or kill")
+                return ActionResult(False, f"Unknown method {method}; use delete, force_delete, delete_with_pvc or kill")
         names = [p["name"] for p in victims]
         if not params.get("wait", True):
             obs.stop()
@@ -81,6 +86,21 @@ class InjectPodFailureAction(BaseAction):
             # best effort from inside: SIGSEGV is handled by the JVM and aborts it
             r = k8s.exec_in_pod(self.namespace, pod["name"], "kill", "-SEGV", "1")
             self.logger.info(f"kill -SEGV 1 in {pod['name']}: rc={r.returncode} {r.stderr.strip()[:200]}")
+
+
+class ScaleOperatorAction(BaseAction):
+    """Scale the operator Deployment to `replicas` (0 = operator down while something else happens) and wait for it."""
+
+    action_name = "scale_operator"
+    params = {"replicas"}
+
+    def execute(self, params):
+        from oko_test_harness.actions.cluster import operator_deployment
+
+        ns, n = self.config.opensearch.operator_namespace, int(params["replicas"])
+        k8s.kubectl("scale", f"deployment/{operator_deployment(self.config.opensearch.operator_release, ns)}", "-n", ns, f"--replicas={n}")
+        k8s.wait_for(f"operator at {n} replicas", lambda: len([p for p in operator_pods(ns) if p["ready"] and not p["deletion"]]) == n and len(operator_pods(ns)) == n, self.timeout("5m"), 5)
+        return ActionResult(True, f"Operator scaled to {n} replica(s)")
 
 
 class KillOperatorAction(BaseAction):

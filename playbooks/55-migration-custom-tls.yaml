@@ -1,0 +1,147 @@
+metadata:
+  description: "A legacy 2.8.0 cluster with user-provided cert-manager certificates (generate: false for transport and HTTP, custom admin cert, adminDn in its 2.x location under transport). After the operator upgrade the migrated cluster must keep serving the custom certificates: the operator must not generate its own secrets (no <cluster>-ca/-http-cert/-transport-cert/-admin-cert), the certificate-ownership transfer must tolerate their absence, a rolling restart and a major OpenSearch upgrade must work with the custom certs, and deleting the legacy CR afterwards must leave the cluster untouched"
+
+config:
+  opensearch:
+    api_group: "opensearch.opster.io"
+
+phases:
+  - name: setup_with_operator_2_8
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+        params: {version: "${OPERATOR_PREV:-2.8.0}", values: {"kubeRbacProxy.enable": "false"}}
+      - action: apply_resource
+        params:
+          manifest: {apiVersion: cert-manager.io/v1, kind: Issuer, metadata: {name: oko-selfsigned}, spec: {selfSigned: {}}}
+      - action: apply_resource
+        params:
+          wait_condition: Ready
+          manifest:
+            apiVersion: cert-manager.io/v1
+            kind: Certificate
+            metadata: {name: oko-ca}
+            spec: {isCA: true, commonName: oko-ca, secretName: oko-ca, privateKey: {algorithm: RSA, size: 2048}, issuerRef: {name: oko-selfsigned, kind: Issuer}}
+      - action: apply_resource
+        params:
+          manifest: {apiVersion: cert-manager.io/v1, kind: Issuer, metadata: {name: oko-ca}, spec: {ca: {secretName: oko-ca}}}
+      - action: apply_resource
+        params:
+          wait_condition: Ready
+          manifest:
+            apiVersion: cert-manager.io/v1
+            kind: Certificate
+            metadata: {name: oko-transport}
+            spec:
+              secretName: oko-transport-cert
+              privateKey: {algorithm: RSA, size: 2048, encoding: PKCS8}
+              commonName: __CLUSTER__-node
+              subject: {organizationalUnits: [oko]}
+              usages: [digital signature, key encipherment, server auth, client auth]
+              dnsNames: ["__CLUSTER__-discovery", "__CLUSTER__-discovery.__NAMESPACE__.svc", "*.__CLUSTER__-discovery.__NAMESPACE__.svc.cluster.local"]
+              issuerRef: {name: oko-ca, kind: Issuer}
+      - action: apply_resource
+        params:
+          wait_condition: Ready
+          manifest:
+            apiVersion: cert-manager.io/v1
+            kind: Certificate
+            metadata: {name: oko-http}
+            spec:
+              secretName: oko-http-cert
+              privateKey: {algorithm: RSA, size: 2048, encoding: PKCS8}
+              commonName: __CLUSTER__
+              subject: {organizationalUnits: [oko]}
+              usages: [digital signature, key encipherment, server auth]
+              dnsNames: ["__CLUSTER__", "__CLUSTER__.__NAMESPACE__", "__CLUSTER__.__NAMESPACE__.svc", "__CLUSTER__.__NAMESPACE__.svc.cluster.local", "*.__CLUSTER__-discovery.__NAMESPACE__.svc.cluster.local"]
+              issuerRef: {name: oko-ca, kind: Issuer}
+      - action: apply_resource
+        params:
+          wait_condition: Ready
+          manifest:
+            apiVersion: cert-manager.io/v1
+            kind: Certificate
+            metadata: {name: oko-admin}
+            spec:
+              secretName: oko-admin-cert
+              privateKey: {algorithm: RSA, size: 2048, encoding: PKCS8}
+              commonName: admin
+              subject: {organizationalUnits: [oko]}
+              usages: [digital signature, key encipherment, client auth]
+              issuerRef: {name: oko-ca, kind: Issuer}
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_2X:-2.19.6}"
+          dashboards: {enabled: false, replicas: 1}  # N25 sidestep, see playbook 50
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+          extra_spec:
+            security:
+              config: {adminSecret: {name: oko-admin-cert}}
+              tls:
+                # 2.x CRDs only know transport.adminDn (3.x moved it to http.adminDn and deprecated the old place): the migrated CR keeps the legacy field
+                transport: {generate: false, perNode: false, secret: {name: oko-transport-cert}, nodesDn: ["CN=__CLUSTER__-node,OU=oko"], adminDn: ["CN=admin,OU=oko"]}
+                http: {generate: false, secret: {name: oko-http-cert}}
+      - action: wait_for_cluster_ready
+        params: {timeout: 30m}
+      - action: check_k8s_resource
+        params: {kind: secret, name: __CLUSTER__-ca, exists: false}
+      - action: index_documents
+        params: {index: data-a, count: 2000, shards: 3, replicas: 1}
+
+  - name: operator_upgrade_keeps_custom_certs
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 10m, min_success_ratio: 0.9}
+      - action: upgrade_operator
+        params: {version: local, expect_restart: true, timeout: 20m}  # N26
+      - action: set_api_group
+        params: {api_group: opensearch.org, timeout: 10m}
+      - action: wait_for_cluster_ready
+        params: {timeout: 20m}
+      - action: check_k8s_resource
+        params: {kind: secret, name: __CLUSTER__-ca, exists: false}
+      - action: check_k8s_resource
+        params: {kind: secret, name: __CLUSTER__-http-cert, exists: false}
+      - action: check_k8s_resource
+        params: {kind: secret, name: __CLUSTER__-transport-cert, exists: false}
+      - action: check_k8s_resource
+        params: {kind: secret, name: __CLUSTER__-admin-cert, exists: false}
+      - action: check_pod_exec
+        params:
+          all_pods: true
+          command: "jdk/bin/keytool -printcert -file config/tls-http/tls.crt | grep -E 'Owner|Issuer'"
+          contains: ["Owner: CN=__CLUSTER__, OU=oko", "Issuer: CN=oko-ca"]
+      - action: check_pod_exec
+        params:
+          all_pods: true
+          command: "grep -E -A1 'nodes_dn|admin_dn' config/opensearch.yml"
+          contains: ["CN=__CLUSTER__-node,OU=oko", "CN=admin,OU=oko"]
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/api/internalusers/admin, status: 200}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+      - action: validate_operator_status
+
+  - name: operations_with_custom_certs
+    steps:
+      - action: rolling_restart
+        params: {node_pool: {component: nodes, jvm: "-Xmx700m -Xms700m"}, expect_pools: [nodes], max_unready_pods: 1, min_health: yellow}
+      - action: wait_for_cluster_ready
+      - action: upgrade_cluster
+        params: {target_version: "${OS_VERSION_3X_OLD:-3.0.0}", max_unready_pods: 1}
+      - action: wait_for_cluster_ready
+        params: {expect_version: "${OS_VERSION_3X_OLD:-3.0.0}"}
+      - action: check_pod_exec
+        params: {all_pods: true, command: "jdk/bin/keytool -printcert -file config/tls-http/tls.crt | grep Owner", contains: ["Owner: CN=__CLUSTER__, OU=oko"]}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+      - action: delete_resource
+        params: {kind: opensearchclusters.opensearch.opster.io, name: __CLUSTER__, expect_pods_untouched: true}
+      - action: wait_for_cluster_ready
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

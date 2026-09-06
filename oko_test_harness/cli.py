@@ -117,6 +117,15 @@ def cleanup(all_clusters):
     for ns in nss:
         k8s.kubectl("delete", "ns", ns, "--wait=false", check=False)
     click.echo(f"Deleted namespaces: {nss or 'none'}")
+    # a namespace stays Terminating while operator CRs keep their finalizers (operator gone, or its reconciler never lets go:
+    # FINDINGS-round5 N34); after a grace period strip them so the next playbook can replace the operator
+    deadline = time.time() + 180
+    while time.time() < deadline and any(k8s.run(["kubectl", "get", "ns", ns], check=False).returncode == 0 for ns in nss):
+        time.sleep(10)
+    for ns in nss:
+        if k8s.run(["kubectl", "get", "ns", ns], check=False).returncode == 0:
+            freed = k8s.strip_operator_finalizers(ns)
+            click.echo(f"Namespace {ns} still Terminating after 3 min; stripped finalizers from {freed or 'no CRs'} (see FINDINGS-round5 N34)")
     if all_clusters:
         from oko_test_harness.playbook import load_global_config
 

@@ -1,0 +1,145 @@
+metadata:
+  description: "Operator 2.3.2 (built from its git tag: the 2.3.x images were removed from every registry) manages a cluster shaped like the 2.x opensearch-cluster Helm chart wrote it: legacy 'master' role name, Dashboards enabled, drainDataNodes, default PVCs. Upgrading the operator straight to the local 3.x build must migrate it to opensearch.org, transfer certificate-secret ownership, backfill PVC/pod labels, keep every REST-created object (a securityadmin re-run must not wipe the internal user), keep Dashboards up, then upgrade OpenSearch and Dashboards to 3.x, and deleting the new CR must cascade to the legacy CR and the certificate secrets"
+
+config:
+  opensearch:
+    api_group: "opensearch.opster.io"
+
+phases:
+  - name: setup_with_operator_2_3
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+        # chart 2.3.2 pins gcr.io/kubebuilder/kube-rbac-proxy:v0.12.0, which no longer exists; brancz publishes the same tag on quay
+        params: {version: "2.3.2", build_ref: v2.3.2, values: {"kubeRbacProxy.image.repository": "quay.io/brancz/kube-rbac-proxy"}}
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_2X:-2.19.6}"
+          drain_data_nodes: true
+          dashboards: {enabled: true, replicas: 1}
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["master", "data"]}
+          extra_spec: {general: {vendor: opensearch}, initHelper: {image: "busybox:1.36", imagePullPolicy: IfNotPresent}}  # 2.3.2 defaults to public.ecr.aws/opsterio/busybox, a registry that no longer exists
+      - action: wait_for_cluster_ready
+        params: {timeout: 30m}  # OrderedReady pods, one at a time
+      - action: validate_cluster_configuration
+        params: {total_nodes: 3, roles: {cluster_manager: 3, data: 3}}
+      - action: validate_dashboards
+      - action: index_documents
+        params: {index: data-a, count: 3000, shards: 3, replicas: 1}
+      # state that only lives inside OpenSearch: a securityadmin re-run with the initial config would wipe the user
+      - action: check_opensearch_api
+        params:
+          path: /_plugins/_security/api/internalusers/legacy-user
+          method: PUT
+          status: 201
+          body: {password: "LegacyUser123!", backend_roles: ["admin"]}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_security/authinfo, user: {username: legacy-user, password: "LegacyUser123!"}, expect: {user_name: legacy-user}}
+      - action: check_opensearch_api
+        params:
+          path: /_index_template/legacy-logs
+          method: PUT
+          body: {index_patterns: ["legacy-logs-*"], template: {settings: {number_of_shards: 1, number_of_replicas: 1}}}
+      - action: check_opensearch_api
+        params:
+          path: /_plugins/_ism/policies/legacy-policy
+          method: PUT
+          status: 201
+          body: {policy: {description: "hot only", default_state: hot, states: [{name: hot, actions: [{replica_count: {number_of_replicas: 1}}], transitions: []}]}}
+      - action: check_opensearch_api
+        params: {path: /_cluster/settings, method: PUT, body: {persistent: {"cluster.max_shards_per_node": "1500"}}}
+
+  - name: operator_upgrade_migrates_the_cluster
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 10m, min_success_ratio: 0.9}
+      - action: upgrade_operator
+        # the 3.x reconciler recreates the StatefulSet and rolls every node once it adopts the migrated CR (FINDINGS-round3 N26)
+        params: {version: local, expect_restart: true, timeout: 20m}
+      - action: set_api_group
+        params: {api_group: opensearch.org, timeout: 10m}
+      - action: check_k8s_resource
+        params:
+          kind: opensearchclusters.opensearch.org
+          name: __CLUSTER__
+          expect:
+            metadata.annotations: {"opensearch.org/migrated-from": "opensearch.opster.io/v1"}
+            status.initialized: true
+      - action: wait_for_cluster_ready
+        params: {timeout: 20m}
+      - action: validate_operator_status
+
+  - name: migrated_resources
+    steps:
+      # certificate secrets must now be owned by the opensearch.org CR (otherwise deleting the legacy CR garbage-collects them)
+      - action: check_k8s_resource
+        params: {kind: secret, name: __CLUSTER__-ca, expect: {metadata.ownerReferences: [{apiVersion: opensearch.org/v1, kind: OpenSearchCluster, name: __CLUSTER__}]}}
+      - action: check_k8s_resource
+        params: {kind: secret, name: __CLUSTER__-transport-cert, expect: {metadata.ownerReferences: [{apiVersion: opensearch.org/v1, name: __CLUSTER__}]}}
+      - action: check_k8s_resource
+        params: {kind: secret, name: __CLUSTER__-http-cert, expect: {metadata.ownerReferences: [{apiVersion: opensearch.org/v1, name: __CLUSTER__}]}}
+      - action: check_k8s_resource
+        params: {kind: secret, name: __CLUSTER__-admin-cert, expect: {metadata.ownerReferences: [{apiVersion: opensearch.org/v1, name: __CLUSTER__}]}}
+      # PVCs created with opster.io labels get the opensearch.org labels backfilled; pods carry the new labels (selector uses them)
+      - action: check_k8s_resource
+        params: {kind: pvc, selector: "opensearch.org/opensearch-cluster=__CLUSTER__", min_count: 3, expect: {metadata.labels: {"opensearch.org/opensearch-nodepool": nodes}}}
+      - action: check_k8s_resource
+        params: {kind: pod, component: nodes, min_count: 3}
+      - action: check_k8s_resource
+        params: {kind: statefulset, name: __CLUSTER__-nodes, expect: {status.readyReplicas: 3, spec.podManagementPolicy: Parallel}}
+      - action: validate_cluster_configuration
+        params: {total_nodes: 3, roles: {cluster_manager: 3, data: 3}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 3000}
+      - action: query_documents
+        params: {index: data-live, expected_min_count: 3000}
+      # EXPECTED TO FAIL (FINDINGS-round5 N31): the 3.x operator re-runs the securityconfig job when it adopts the migrated
+      # cluster and securityadmin replaces the internal users with the secret's initial set; continue so the rest still runs
+      - action: check_opensearch_api
+        continue_on_error: true
+        params: {path: /_plugins/_security/authinfo, user: {username: legacy-user, password: "LegacyUser123!"}, expect: {user_name: legacy-user}}
+      - action: check_opensearch_api
+        params: {path: /_index_template/legacy-logs, expect: {index_templates: [{name: legacy-logs}]}}
+      - action: check_opensearch_api
+        params: {path: /_plugins/_ism/policies/legacy-policy, expect: {policy.default_state: hot}}
+      - action: check_opensearch_api
+        params: {path: /_cluster/settings, expect: {persistent.cluster.max_shards_per_node: "1500"}}
+      - action: validate_dashboards
+      - action: validate_node_configuration
+
+  - name: post_migration_major_upgrade
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live2, count: 200, replicas: 1, duration: 10m, min_success_ratio: 0.9}
+      - action: upgrade_cluster
+        params: {target_version: "${OS_VERSION_3X_OLD:-3.0.0}", max_unready_pods: 1}
+      - action: wait_for_cluster_ready
+        params: {expect_version: "${OS_VERSION_3X_OLD:-3.0.0}"}
+      - action: patch_cluster
+        params: {patch: {spec: {dashboards: {version: "${OS_VERSION_3X_OLD:-3.0.0}"}}}}
+      - action: wait_dashboards_version
+        params: {version: "${OS_VERSION_3X_OLD:-3.0.0}", max_unavailable: 1}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 3000}
+      - action: check_opensearch_api
+        continue_on_error: true  # N31, see above
+        params: {path: /_plugins/_security/authinfo, user: {username: legacy-user, password: "LegacyUser123!"}, expect: {user_name: legacy-user}}
+      - action: validate_operator_status
+
+  - name: deleting_the_new_cr_cascades
+    steps:
+      - action: delete_cluster
+      - action: check_k8s_resource
+        params: {kind: opensearchclusters.opensearch.opster.io, name: __CLUSTER__, exists: false, timeout: 5m}
+      - action: check_k8s_resource
+        params: {kind: secret, name: __CLUSTER__-ca, exists: false, timeout: 5m}
+      - action: check_k8s_resource
+        params: {kind: deployment, name: __CLUSTER__-dashboards, exists: false, timeout: 5m}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster
