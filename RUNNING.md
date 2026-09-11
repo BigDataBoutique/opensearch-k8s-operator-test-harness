@@ -1,8 +1,5 @@
 # Running the harness (guide for Claude sessions and humans)
 
-Practical notes from running the suite end to end on a Linux dev box (28 CPU / 62 GB / k3d). Read this before
-starting a run; README.md explains the playbook format and actions.
-
 ## 0. Environment checklist (2 minutes)
 
 ```bash
@@ -65,11 +62,6 @@ pgrep -fa "scripts/chain" | grep -v pgrep | awk '{print $1}' | xargs -r kill
 pgrep -fa "bin/python" | grep -E "playbooks/[0-9]" | awk '{print $1}' | xargs -r kill
 ```
 The harness process is `.venv/bin/python -c ...` under poetry; the playbook path is in its arguments.
-
-**Operator source changes mid-suite.** `install_operator` derives the image tag from the operator's git sha and
-diff, so if `../opensearch-k8s-operator` HEAD moves while lanes are running, the next playbook rebuilds and
-`helm upgrade`s the operator underneath every other running playbook (an unplanned operator restart mid-upgrade).
-Check `git -C ../opensearch-k8s-operator log -1 --oneline` before starting lanes and keep it stable during a suite.
 
 ## 3. Reading results
 
@@ -148,7 +140,7 @@ helm search repo opensearch-operator --versions | head
 
 1. `10-basic-3x`, `11-basic-2x`, `12-coordinator-nodes` (fast smoke, run first)
 2. Lane A: `20-upgrade-minor-2x`, `22-upgrade-minor-3x`, `30-scaling`, `31-scale-and-upgrade-together`
-3. Lane B: `21-upgrade-major-2x-to-3x`, `23-upgrade-abort`, `40-chaos`, `41-upgrade-under-chaos`, `61-managed-resources-crds`
+3. Lane B: `21-upgrade-major-2x-to-3x`, `23-upgrade-abort`, `40-chaos`, `41-upgrade-under-chaos`
 4. `51`, `50`, `52`, `54`, `55`, `53` alone at the end (each installs a released 2.x operator, then upgrades to the local build; see 4b)
 
 Judge a failure by category: harness bug (fix and re-run), environment (section 4), or operator behaviour

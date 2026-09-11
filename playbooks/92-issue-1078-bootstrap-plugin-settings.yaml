@@ -1,0 +1,39 @@
+metadata:
+  description: "Issue #1078 (fixed by a2a1da6: the bootstrap pod installs general.pluginsList): a setting registered by a plugin (repository-s3's s3.client.default.*) in general.additionalConfig must not crash the bootstrap pod with 'unknown setting'; the cluster forms and every node carries the plugin and the setting"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_2X:-2.19.6}"
+          plugins: ["repository-s3"]
+          cluster_settings:
+            "s3.client.default.region": "us-gov-west-1"
+            "s3.client.default.endpoint": "s3.us-gov-west-1.amazonaws.com"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      # a bootstrap pod that crash-loops on the unknown setting keeps the cluster from forming, so this is the regression check
+      - action: wait_for_cluster_ready
+
+  - name: validate
+    steps:
+      - action: validate_cluster_configuration
+        params: {total_nodes: 3, roles: {cluster_manager: 3, data: 3, ingest: 3}, plugins: ["repository-s3"]}
+      - action: check_pod_exec
+        params:
+          component: nodes
+          all_pods: true
+          command: "grep '^s3.client.default' config/opensearch.yml"
+          contains: ["s3.client.default.region: us-gov-west-1", "s3.client.default.endpoint: s3.us-gov-west-1.amazonaws.com"]
+      - action: index_documents
+        params: {index: data-a, count: 1000, shards: 3, replicas: 1}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 1000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

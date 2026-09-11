@@ -1,0 +1,82 @@
+metadata:
+  description: "general.nodeAttributes resolves node.attr.* from a node label and makes the operator create a per-cluster <cluster>-<namespace>-node-attributes ClusterRoleBinding (cluster-scoped, no owner reference, so only the operator's delete path can remove it): a normal delete removes it, a binding already deleted by hand does not block the finalizer, and a CR deleted while the operator is down (playbook 76) still ends with the binding gone"
+
+# kubernetes.io/hostname is on every node (k3d/kind nodes carry no topology.kubernetes.io/zone label, which would
+# leave the attribute empty and make the test about the environment instead of the operator)
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+
+  - name: delete_removes_binding
+    steps:
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+          extra_spec:
+            general:
+              nodeAttributes:
+                - {name: k8s_node, nodeLabel: "kubernetes.io/hostname"}
+      - action: wait_for_cluster_ready
+      - action: check_opensearch_api
+        params: {path: "/_cat/nodeattrs?h=attr", contains: ["k8s_node"]}
+      - action: check_k8s_resource
+        params: {kind: clusterrolebindings, name: "__CLUSTER__-__NAMESPACE__-node-attributes"}
+      - action: delete_cluster
+      - action: check_k8s_resource
+        params: {kind: clusterrolebindings, name: "__CLUSTER__-__NAMESPACE__-node-attributes", exists: false}
+      - action: validate_operator_status
+
+  - name: binding_already_gone
+    description: "DeleteClusterRoleBinding ignores NotFound: a binding removed out of band must not keep the finalizer from being removed"
+    steps:
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+          extra_spec:
+            general:
+              nodeAttributes:
+                - {name: k8s_node, nodeLabel: "kubernetes.io/hostname"}
+      - action: wait_for_cluster_ready
+      - action: delete_resource
+        params: {kind: clusterrolebindings, name: "__CLUSTER__-__NAMESPACE__-node-attributes"}
+      - action: delete_cluster
+      - action: validate_operator_status
+
+  - name: delete_while_operator_down
+    description: "Playbook 76's delete-while-operator-down with nodeAttributes on: the returning operator must finish the deletion and remove the binding"
+    steps:
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+          extra_spec:
+            general:
+              nodeAttributes:
+                - {name: k8s_node, nodeLabel: "kubernetes.io/hostname"}
+      - action: wait_for_cluster_ready
+      - action: scale_operator
+        params: {replicas: 0}
+      - action: delete_resource
+        params: {kind: opensearchclusters.opensearch.org, name: __CLUSTER__, wait_gone: false}
+      - action: check_k8s_resource
+        params: {kind: opensearchclusters.opensearch.org, name: __CLUSTER__, expect: {metadata.finalizers: [Opensearch]}}
+      - action: scale_operator
+        params: {replicas: 1}
+      - action: check_k8s_resource
+        params: {kind: opensearchclusters.opensearch.org, name: __CLUSTER__, exists: false, timeout: 10m}
+      - action: check_k8s_resource
+        params: {kind: pod, component: nodes, exists: false, timeout: 5m}
+      - action: check_k8s_resource
+        params: {kind: clusterrolebindings, name: "__CLUSTER__-__NAMESPACE__-node-attributes", exists: false}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

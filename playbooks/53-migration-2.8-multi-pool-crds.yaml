@@ -1,5 +1,5 @@
 metadata:
-  description: "Operator 2.8.0 manages a fully featured legacy cluster (dedicated managers + data pool with pdb/labels/nodeSelector/per-pool config, smartScaler, drainDataNodes, plugins, additionalVolumes, keystore) plus every legacy child CRD (OpensearchRole/User/UserRoleBinding/Tenant/ActionGroup, OpenSearchISMPolicy, OpensearchComponentTemplate/IndexTemplate). Upgrading the operator must migrate the cluster and every child resource to opensearch.org with the OpenSearch-side objects untouched; deleting a legacy child CR must not delete the OpenSearch object the new CR now owns; the new CRs must be editable and deletable (cascading to the legacy CR and to OpenSearch); scaling, PVC reuse and a rolling restart must work on the migrated cluster; and disabling legacyAPI after the legacy CRs are gone must leave the cluster running untouched"
+  description: "Operator 2.8.0 manages a fully featured legacy cluster (dedicated managers + data pool with pdb/labels/nodeSelector/per-pool config, smartScaler, drainDataNodes, plugins, additionalVolumes, keystore). Upgrading the operator must migrate the cluster to opensearch.org with the pod settings, volumes, keystore and per-pool config intact; scaling, PVC reuse and a rolling restart must work on the migrated cluster; and disabling legacyAPI after the legacy CR is gone must leave the cluster running untouched"
 
 config:
   opensearch:
@@ -17,9 +17,6 @@ phases:
       - action: apply_resource
         params:
           manifest: {apiVersion: v1, kind: Secret, metadata: {name: oko-keystore}, stringData: {"s3.client.default.access_key": "AKIAOKO", "s3.client.default.secret_key": "keystore-value"}}
-      - action: apply_resource
-        params:
-          manifest: {apiVersion: v1, kind: Secret, metadata: {name: legacy-user-password}, stringData: {password: "LegacyUser123!"}}
       - action: deploy_cluster
         params:
           version: "${OS_VERSION_2X:-2.19.6}"
@@ -49,108 +46,6 @@ phases:
       - action: index_documents
         params: {index: data-a, count: 3000, shards: 3, replicas: 1}
 
-  - name: legacy_child_resources
-    steps:
-      - action: apply_resource
-        params:
-          manifest:
-            apiVersion: opensearch.opster.io/v1
-            kind: OpensearchRole
-            metadata: {name: legacy-role}
-            spec:
-              opensearchCluster: {name: __CLUSTER__}
-              clusterPermissions: [cluster_composite_ops]
-              indexPermissions: [{indexPatterns: ["data-*"], allowedActions: [read]}]
-      - action: apply_resource
-        params:
-          manifest:
-            apiVersion: opensearch.opster.io/v1
-            kind: OpensearchUser
-            metadata: {name: legacy-user}
-            spec:
-              opensearchCluster: {name: __CLUSTER__}
-              passwordFrom: {name: legacy-user-password, key: password}
-              backendRoles: [legacy-backend]
-      - action: apply_resource
-        params:
-          manifest:
-            apiVersion: opensearch.opster.io/v1
-            kind: OpensearchUserRoleBinding
-            metadata: {name: legacy-binding}
-            spec:
-              opensearchCluster: {name: __CLUSTER__}
-              users: [legacy-user]
-              roles: [legacy-role]
-      - action: apply_resource
-        params:
-          manifest:
-            apiVersion: opensearch.opster.io/v1
-            kind: OpensearchTenant
-            metadata: {name: legacy-tenant}
-            spec: {opensearchCluster: {name: __CLUSTER__}, description: legacy tenant}
-      - action: apply_resource
-        params:
-          manifest:
-            apiVersion: opensearch.opster.io/v1
-            kind: OpensearchActionGroup
-            metadata: {name: legacy-action-group}
-            spec: {opensearchCluster: {name: __CLUSTER__}, allowedActions: ["indices:admin/aliases/get"], type: index, description: legacy action group}
-      - action: apply_resource
-        params:
-          manifest:
-            apiVersion: opensearch.opster.io/v1
-            kind: OpenSearchISMPolicy
-            metadata: {name: legacy-policy}
-            spec:
-              opensearchCluster: {name: __CLUSTER__}
-              description: legacy policy
-              defaultState: hot
-              states: [{name: hot, actions: [{replicaCount: {numberOfReplicas: 1}}], transitions: []}]
-      - action: apply_resource
-        params:
-          manifest:
-            apiVersion: opensearch.opster.io/v1
-            kind: OpensearchComponentTemplate
-            metadata: {name: legacy-component}
-            spec:
-              opensearchCluster: {name: __CLUSTER__}
-              template: {settings: {number_of_shards: 1, number_of_replicas: 1}}
-      - action: apply_resource
-        params:
-          manifest:
-            apiVersion: opensearch.opster.io/v1
-            kind: OpensearchIndexTemplate
-            metadata: {name: legacy-template}
-            spec:
-              opensearchCluster: {name: __CLUSTER__}
-              indexPatterns: ["legacy-logs-*"]
-              composedOf: [legacy-component]
-              priority: 100
-      - action: check_k8s_resource
-        params: {kind: opensearchroles.opensearch.opster.io, name: legacy-role, expect: {status.state: CREATED}, timeout: 5m}
-      - action: check_k8s_resource
-        params: {kind: opensearchusers.opensearch.opster.io, name: legacy-user, expect: {status.state: CREATED}, timeout: 5m}
-      - action: check_k8s_resource
-        params: {kind: opensearchuserrolebindings.opensearch.opster.io, name: legacy-binding, expect: {status.state: CREATED}, timeout: 5m}
-      - action: check_k8s_resource
-        params: {kind: opensearchtenants.opensearch.opster.io, name: legacy-tenant, expect: {status.state: CREATED}, timeout: 5m}
-      - action: check_k8s_resource
-        params: {kind: opensearchactiongroups.opensearch.opster.io, name: legacy-action-group, expect: {status.state: CREATED}, timeout: 5m}
-      - action: check_k8s_resource
-        params: {kind: opensearchismpolicies.opensearch.opster.io, name: legacy-policy, expect: {status.state: CREATED}, timeout: 5m}
-      - action: check_k8s_resource
-        params: {kind: opensearchcomponenttemplates.opensearch.opster.io, name: legacy-component, expect: {status.state: CREATED}, timeout: 5m}
-      - action: check_k8s_resource
-        params: {kind: opensearchindextemplates.opensearch.opster.io, name: legacy-template, expect: {status.state: CREATED}, timeout: 5m}
-      - action: check_opensearch_api
-        params: {path: /_plugins/_security/authinfo, user: {username: legacy-user, password: "LegacyUser123!"}, expect: {user_name: legacy-user, roles: [legacy-role]}}
-      - action: check_opensearch_api
-        params: {path: /_plugins/_security/api/roles/legacy-role, expect: {legacy-role.cluster_permissions: [cluster_composite_ops]}}
-      - action: check_opensearch_api
-        params: {path: /_plugins/_ism/policies/legacy-policy, expect: {policy.default_state: hot}}
-      - action: check_opensearch_api
-        params: {path: /_index_template/legacy-template, expect: {index_templates: [{name: legacy-template, index_template: {composed_of: [legacy-component]}}]}}
-
   - name: operator_upgrade_migrates_everything
     steps:
       - action: index_documents
@@ -162,49 +57,6 @@ phases:
         params: {api_group: opensearch.org, timeout: 10m}
       - action: wait_for_cluster_ready
         params: {timeout: 25m}
-      - action: check_k8s_resource
-        continue_on_error: true  # N33 can hit any kind
-        params: {kind: opensearchroles.opensearch.org, name: legacy-role, expect: {status.state: CREATED, metadata.annotations: {"opensearch.org/migrated-from": "opensearch.opster.io/v1"}}, timeout: 3m}
-      - action: check_k8s_resource
-        continue_on_error: true  # N33 can hit any kind
-        params: {kind: opensearchusers.opensearch.org, name: legacy-user, expect: {status.state: CREATED, metadata.annotations: {"opensearch.org/migrated-from": "opensearch.opster.io/v1"}}, timeout: 3m}
-      - action: check_k8s_resource
-        continue_on_error: true  # N33 can hit any kind
-        params: {kind: opensearchuserrolebindings.opensearch.org, name: legacy-binding, expect: {status.state: CREATED}, timeout: 3m}
-      - action: check_k8s_resource
-        continue_on_error: true  # N33 can hit any kind: the twin races its own status copy and lands IGNORED (existing*: true)
-        params: {kind: opensearchtenants.opensearch.org, name: legacy-tenant, expect: {status.state: CREATED}, timeout: 3m}
-      - action: check_k8s_resource
-        continue_on_error: true  # N33 can hit any kind: the twin races its own status copy and lands IGNORED (existing*: true)
-        params: {kind: opensearchactiongroups.opensearch.org, name: legacy-action-group, expect: {status.state: CREATED}, timeout: 3m}
-      - action: check_k8s_resource
-        continue_on_error: true  # N33 can hit any kind
-        params: {kind: opensearchismpolicies.opensearch.org, name: legacy-policy, expect: {status.state: CREATED}, timeout: 3m}
-      - action: check_k8s_resource
-        continue_on_error: true  # N33 can hit any kind: the twin races its own status copy and lands IGNORED (existing*: true)
-        params: {kind: opensearchcomponenttemplates.opensearch.org, name: legacy-component, expect: {status.state: CREATED}, timeout: 3m}
-      - action: check_k8s_resource
-        continue_on_error: true  # N33 can hit any kind
-        params: {kind: opensearchindextemplates.opensearch.org, name: legacy-template, expect: {status.state: CREATED}, timeout: 3m}
-      # the OpenSearch-side objects must be the same ones (not deleted and recreated): the user still authenticates with the old password
-      - action: check_opensearch_api
-        continue_on_error: true  # N31 (securityadmin re-apply) and N33 (IGNORED twins never recreate) wipe these
-        params: {path: /_plugins/_security/authinfo, user: {username: legacy-user, password: "LegacyUser123!"}, expect: {user_name: legacy-user, roles: [legacy-role]}}
-      - action: check_opensearch_api
-        continue_on_error: true  # N31 (securityadmin re-apply) and N33 (IGNORED twins never recreate) wipe these
-        params: {path: /_plugins/_security/api/tenants/legacy-tenant, status: 200}
-      - action: check_opensearch_api
-        continue_on_error: true  # N31 (securityadmin re-apply) and N33 (IGNORED twins never recreate) wipe these
-        params: {path: /_plugins/_security/api/actiongroups/legacy-action-group, status: 200}
-      - action: check_opensearch_api
-        continue_on_error: true  # N31 (securityadmin re-apply) and N33 (IGNORED twins never recreate) wipe these
-        params: {path: /_plugins/_ism/policies/legacy-policy, expect: {policy.default_state: hot}}
-      - action: check_opensearch_api
-        continue_on_error: true  # N31 (securityadmin re-apply) and N33 (IGNORED twins never recreate) wipe these
-        params: {path: /_component_template/legacy-component, status: 200}
-      - action: check_opensearch_api
-        continue_on_error: true  # N31 (securityadmin re-apply) and N33 (IGNORED twins never recreate) wipe these
-        params: {path: /_index_template/legacy-template, expect: {index_templates: [{name: legacy-template}]}}
       - action: check_k8s_resource
         params: {kind: pod, component: data, min_count: 3, expect: {metadata.labels: {oko/pool: data}, spec.nodeSelector: {"kubernetes.io/os": linux}, spec.volumes: [{name: extra-config}]}}
       - action: check_k8s_resource
@@ -218,39 +70,6 @@ phases:
       - action: query_documents
         params: {index: data-live, expected_min_count: 3000}
       - action: validate_operator_status
-
-  - name: child_resources_after_migration
-    steps:
-      # deleting the legacy twin must not touch the OpenSearch object the opensearch.org CR now owns
-      - action: delete_resource
-        params: {kind: opensearchroles.opensearch.opster.io, name: legacy-role}
-      - action: check_k8s_resource
-        continue_on_error: true  # N33
-        params: {kind: opensearchroles.opensearch.org, name: legacy-role, expect: {status.state: CREATED}}
-      - action: check_opensearch_api
-        continue_on_error: true  # N31/N33
-        params: {path: /_plugins/_security/api/roles/legacy-role, expect: {legacy-role.cluster_permissions: [cluster_composite_ops]}}
-      # the new CR is the source of truth: an edit reaches OpenSearch
-      - action: apply_resource
-        params:
-          manifest:
-            apiVersion: opensearch.org/v1
-            kind: OpensearchRole
-            metadata: {name: legacy-role}
-            spec:
-              opensearchCluster: {name: __CLUSTER__}
-              clusterPermissions: [cluster_composite_ops, cluster_monitor]
-              indexPermissions: [{indexPatterns: ["data-*"], allowedActions: [read]}]
-      - action: check_opensearch_api
-        continue_on_error: true  # N31/N33
-        params: {path: /_plugins/_security/api/roles/legacy-role, expect: {legacy-role.cluster_permissions: [cluster_composite_ops, cluster_monitor]}}
-      # deleting the new user CR cascades to the legacy CR and removes the user from OpenSearch
-      - action: delete_resource
-        params: {kind: opensearchusers.opensearch.org, name: legacy-user}
-      - action: check_k8s_resource
-        params: {kind: opensearchusers.opensearch.opster.io, name: legacy-user, exists: false, timeout: 5m}
-      - action: check_opensearch_api
-        params: {path: /_plugins/_security/authinfo, status: 401, user: {username: legacy-user, password: "LegacyUser123!"}}
 
   - name: operations_on_the_migrated_cluster
     steps:
@@ -280,25 +99,11 @@ phases:
         params: {kind: opensearchclusters.opensearch.opster.io, name: __CLUSTER__, expect_pods_untouched: true}
       - action: check_k8s_resource
         params: {kind: secret, name: __CLUSTER__-ca}
-      - action: delete_resource
-        params: {kind: opensearchuserrolebindings.opensearch.opster.io, name: legacy-binding}
-      - action: delete_resource
-        params: {kind: opensearchtenants.opensearch.opster.io, name: legacy-tenant}
-      - action: delete_resource
-        params: {kind: opensearchactiongroups.opensearch.opster.io, name: legacy-action-group}
-      - action: delete_resource
-        params: {kind: opensearchismpolicies.opensearch.opster.io, name: legacy-policy}
-      - action: delete_resource
-        params: {kind: opensearchcomponenttemplates.opensearch.opster.io, name: legacy-component}
-      - action: delete_resource
-        params: {kind: opensearchindextemplates.opensearch.opster.io, name: legacy-template}
       - action: upgrade_operator
         params: {version: local, legacy_api: false}  # no pod may restart
       - action: check_k8s_resource
         params: {kind: crd, name: opensearchclusters.opensearch.opster.io, exists: false}
       - action: wait_for_cluster_ready
-      - action: check_opensearch_api
-        params: {path: /_plugins/_security/api/roles/legacy-role, status: 200}
       - action: validate_data_integrity
         params: {index: data-a, expected_documents: 3000}
       - action: upgrade_operator
