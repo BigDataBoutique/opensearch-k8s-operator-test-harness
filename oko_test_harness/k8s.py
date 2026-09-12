@@ -97,6 +97,12 @@ def replace_cr(cr: Dict[str, Any]) -> None:
     apply(json.dumps(cr))
 
 
+def patch_json(kind: str, name: str, namespace: str, ops: List[Dict[str, Any]]) -> None:
+    """Targeted JSON patch. Unlike replace_cr it writes only the listed paths, so a spec change made
+    concurrently by another step (an upgrade patch, say) is not clobbered by a stale read-modify-write."""
+    kubectl("patch", kind, name, "-n", namespace, "--type", "json", "-p", json.dumps(ops))
+
+
 LEGACY_LABEL_PREFIX = "opster.io/"  # operator <= 2.8 labels pods opster.io/opensearch-cluster|nodepool; 3.x uses opensearch.org/
 
 

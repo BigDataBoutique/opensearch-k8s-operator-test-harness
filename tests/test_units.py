@@ -7,6 +7,7 @@ import pytest
 from oko_test_harness.actions.base import parse_duration
 from oko_test_harness.actions.cluster import DeployClusterAction
 from oko_test_harness.actions.data import generate_docs
+from oko_test_harness.actions.scaling import replicas_patch_ops
 from oko_test_harness.executor import PlaybookExecutor
 from oko_test_harness.models.playbook import Config
 from oko_test_harness.observer import ClusterObserver
@@ -41,6 +42,20 @@ def test_build_cr_roles_and_plugins():
     assert cr["spec"]["general"]["pluginsList"] == ["analysis-icu"]
     assert cr["spec"]["general"]["additionalConfig"] == {"cluster.max_shards_per_node": "2000"}
     json.dumps(cr)  # must be serialisable
+
+
+def test_replicas_patch_ops_touches_only_that_pool():
+    """A scale must not write spec.general: playbook 31 patches the version in the same window, and a full
+    read-modify-write of the CR reverted it (observed 2026-09-12, upgrade silently never happened)."""
+    pools = [{"component": "masters", "replicas": 3}, {"component": "data", "replicas": 2}]
+    ops = replicas_patch_ops(pools, "data", 3)
+    assert ops == [
+        {"op": "test", "path": "/spec/nodePools/1/component", "value": "data"},
+        {"op": "replace", "path": "/spec/nodePools/1/replicas", "value": 3},
+    ]
+    assert not any(o["path"].startswith("/spec/general") for o in ops)
+    with pytest.raises(StopIteration):
+        replicas_patch_ops(pools, "nope", 1)
 
 
 def test_generate_docs_template_ids():

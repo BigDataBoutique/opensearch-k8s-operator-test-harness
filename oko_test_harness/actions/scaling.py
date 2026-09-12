@@ -1,17 +1,31 @@
-"""Scaling actions: replicas of a node pool, adding and removing pools. All go through a full
-read-modify-write of the CR (a merge patch would replace the whole nodePools array)."""
+"""Scaling actions: replicas of a node pool, adding and removing pools. Adding/removing a pool restructures
+the nodePools array, so those go through a full read-modify-write of the CR (a merge patch would replace the
+whole array). Changing replicas patches just that pool's field: a full write would lose a spec change made
+concurrently by another step (playbook 31 scales and upgrades in the same window)."""
 
 import time
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from oko_test_harness import k8s
 from oko_test_harness.actions.base import BaseAction
 from oko_test_harness.models.playbook import ActionResult
 
 
+def replicas_patch_ops(pools: List[Dict[str, Any]], component: str, replicas: int) -> List[Dict[str, Any]]:
+    """JSON patch setting one pool's replicas. The `test` op pins the pool the index refers to, so the patch
+    fails instead of resizing the wrong pool if the array changed between the read and the write."""
+    index = next(i for i, p in enumerate(pools) if p["component"] == component)
+    return [
+        {"op": "test", "path": f"/spec/nodePools/{index}/component", "value": component},
+        {"op": "replace", "path": f"/spec/nodePools/{index}/replicas", "value": replicas},
+    ]
+
+
 class _ScaleBase(BaseAction):
-    def apply_and_wait(self, cr, obs, message: str, expected_nodes: int, params, removed: int = 0, step_drop: Optional[int] = 1):
-        k8s.replace_cr(cr)
+    def apply_and_wait(self, cr, obs, message: str, expected_nodes: int, params, removed: int = 0, step_drop: Optional[int] = 1, write=None):
+        # `write` lets a caller narrow the write to the fields it owns; the default full read-modify-write
+        # loses any spec change another step made since self.cr() was read (see ScaleClusterAction).
+        (write or (lambda: k8s.replace_cr(cr)))()
         self.wait_cluster_running(self.timeout(self.config.timeouts.scaling))
 
         def settled():
@@ -49,9 +63,13 @@ class ScaleClusterAction(_ScaleBase):
         old, new = pool["replicas"], int(params["replicas"])
         obs = self.observer(params.get("indices"))
         time.sleep(obs.interval)
+        ops = replicas_patch_ops(cr["spec"]["nodePools"], component, new)
         pool["replicas"] = new
         expected = sum(p["replicas"] for p in cr["spec"]["nodePools"])
-        result = self.apply_and_wait(cr, obs, f"Scaled pool {component} {old} -> {new}", expected, params, removed=max(0, old - new))
+        result = self.apply_and_wait(
+            cr, obs, f"Scaled pool {component} {old} -> {new}", expected, params, removed=max(0, old - new),
+            write=lambda: k8s.patch_json(self.cr_resource(), self.cluster, self.namespace, ops),
+        )
         if result.success and new < old:
             leftover = [
                 i["metadata"]["name"]

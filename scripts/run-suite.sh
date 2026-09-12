@@ -10,4 +10,4 @@ scripts/run-lane.sh S1 $(p 11 12 20 22 30 31 40 60 64 65 66 67 68 69 70 72 73 74
 scripts/run-lane.sh S2 $(p 21 23 41 71 75 76 77 78 79 81 83 85 87 89 90 91 92) &
 wait
 poetry run oko-test cleanup  # 50 and 54 are expected to fail and keep their namespaces, which would block the next operator replacement
-scripts/run-lane.sh S3 $(p 51 50 52 54 55 53)  # migration playbooks run alone (RUNNING.md 4b); 53 last: it toggles legacyAPI on the shared operator
+LANE_CLEANUP=1 scripts/run-lane.sh S3 $(p 51 50 52 54 55 53)  # migration playbooks run alone (RUNNING.md 4b); 53 last: it toggles legacyAPI on the shared operator. LANE_CLEANUP purges leftover CRs between them: 50 is knowingly blocked by #1540 and keeps its namespace, which otherwise fails 52/54/55/53 instantly (N23)

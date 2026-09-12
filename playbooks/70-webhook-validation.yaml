@@ -39,11 +39,12 @@ phases:
         params:
           cluster_params: {extra_spec: {security: {tls: {http: {enabled: true, generate: false}}}}}
           message: "HTTP TLS is enabled but neither generate nor secret is provided"
-      # unset `enabled` skips the HTTP rule (same gap as transport, N7); the admin-secret rule catches this case instead
+      # since #1546 (d6d2ab3) an unset `enabled` counts as enabled (helpers.IsHttpTlsEnabled), so the HTTP TLS rule
+      # rejects this case; before that fix it slipped past and only the admin-secret rule below caught it (old N7 gap)
       - action: expect_rejected
         params:
           cluster_params: {extra_spec: {security: {tls: {http: {generate: false}}}}}
-          message: "admin secret name is not provided but http.tls generate is not true"
+          message: "HTTP TLS is enabled but neither generate nor secret is provided"
       - action: expect_rejected
         params:
           cluster_params: {extra_spec: {security: {tls: {http: {generate: false, secret: {name: some-http-cert}}}}}}
