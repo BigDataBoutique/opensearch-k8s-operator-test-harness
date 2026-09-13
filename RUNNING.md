@@ -121,6 +121,10 @@ observed *during* the operation; a violation there is the signal that matters fo
   operator is left without the legacy CRDs/webhooks (`70` then fails its `legacy_api_group` phase): rerun `53` or
   `install_operator {version: local, legacy_api: true}` from any playbook. `53` is therefore last in lane S3.
 - `54` runs a second cluster in the fixed namespace `oko-mig-b`; the playbook removes it before its last phase, `oko-test cleanup` removes it otherwise.
+- `62-migration-child-crds` is the child-CRD half of the pre-`694ec5e` `53`, restored on 2026-09-13: it is a superset of `53`
+  (same phases plus `legacy_child_resources` and `child_resources_after_migration`) and the **only** coverage for N33, where a
+  migrated child-CR twin lands `status.state: IGNORED` instead of `CREATED`. Which kind loses that race varies per run, so a
+  single green run does not clear it. Like `53` it toggles `legacyAPI` off and back on, so it runs immediately before `53`.
 
 ## 5. Version knobs
 
@@ -141,7 +145,7 @@ helm search repo opensearch-operator --versions | head
 1. `10-basic-3x`, `11-basic-2x`, `12-coordinator-nodes` (fast smoke, run first)
 2. Lane A: `20-upgrade-minor-2x`, `22-upgrade-minor-3x`, `30-scaling`, `31-scale-and-upgrade-together`
 3. Lane B: `21-upgrade-major-2x-to-3x`, `23-upgrade-abort`, `40-chaos`, `41-upgrade-under-chaos`
-4. `51`, `50`, `52`, `54`, `55`, `53` alone at the end (each installs a released 2.x operator, then upgrades to the local build; see 4b)
+4. `51`, `50`, `52`, `54`, `55`, `62`, `53` alone at the end (each installs a released 2.x operator, then upgrades to the local build; see 4b)
 
 Judge a failure by category: harness bug (fix and re-run), environment (section 4), or operator behaviour
 (collect `logs/<pb>-<ts>/`, the observer summary, and the CR status; that is the finding to report).
