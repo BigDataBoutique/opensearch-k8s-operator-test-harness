@@ -1,0 +1,96 @@
+metadata:
+  description: "Issue #1424 (fixed by abcf7cc / 911f722): a cluster that can never be green (an index with more replicas than the other data nodes can hold) must still be rolling-restarted and upgraded. With drainDataNodes: false the health gate accepts a settled yellow cluster (allocation enabled, nothing initializing, relocating or delayed, every data node joined), restarts strictly one pod at a time, never takes down the only active copy of a shard that should have replicas (the cluster never goes red), and finishes with allocation.enable back to all. Unfixed operators waited for green forever. Third phase, drainDataNodes: true: the restart legitimately stalls (a replica with nowhere to go blocks the drain), but the candidate node must not be left in allocation.exclude._name for the duration of the stall. EXPECTED TO FAIL at that step while upstream #1585 is open."
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X_OLD:-3.0.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 2000, shards: 3, replicas: 1}
+      # 4 copies wanted per shard on 3 data nodes: one replica per shard can never be assigned, so the cluster is
+      # yellow for good while every node holds a copy of every shard (a node going down never takes the last copy).
+      - action: index_documents
+        params: {index: overreplicated, count: 1500, shards: 3, replicas: 3}
+      - action: wait_for_cluster_ready
+        params: {health: yellow, max_unassigned: 3}
+      - action: check_opensearch_api
+        params: {path: /_cluster/health, expect: {status: yellow, unassigned_shards: 3}}
+
+  - name: restart_proceeds_on_yellow
+    description: "Config-change rolling restart with drainDataNodes false on the permanently yellow cluster: every pod replaced, one down at a time, never red under live indexing, all documents kept; afterwards RollingRestart Finished, allocation.enable = all, still exactly 3 unassigned replicas."
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 12m, min_success_ratio: 0.9}
+      - action: rolling_restart
+        params: {patch: {spec: {general: {additionalConfig: {"http.max_content_length": "150mb"}}}}, max_unready_pods: 1, min_health: yellow, final_health: yellow, timeout: 25m}
+      - action: wait_for_cluster_ready
+        params: {health: yellow, max_unassigned: 3}
+      - action: check_k8s_resource
+        params:
+          kind: opensearchclusters.opensearch.org
+          name: __CLUSTER__
+          expect: {status.componentsStatus: [{component: RollingRestart, status: Finished}]}
+      - action: check_pod_exec
+        params: {all_pods: true, command: "grep http.max_content_length config/opensearch.yml", contains: ["http.max_content_length: 150mb"]}
+      - action: check_opensearch_api
+        params: {path: /_cluster/health, expect: {status: yellow, unassigned_shards: 3}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+      - action: validate_data_integrity
+        params: {index: overreplicated, expected_documents: 1500}
+
+  - name: upgrade_proceeds_on_yellow
+    description: "The version upgrade uses the same health gate: it must complete on the yellow cluster, one pod at a time, never red, with every node on the new version and no document loss."
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live2, count: 200, replicas: 1, duration: 12m, min_success_ratio: 0.9}
+      - action: upgrade_cluster
+        params: {target_version: "${OS_VERSION_3X:-3.8.0}", max_unready_pods: 1, min_health: yellow, timeout: 30m}
+      - action: wait_for_cluster_ready
+        params: {health: yellow, max_unassigned: 3, expect_version: "${OS_VERSION_3X:-3.8.0}"}
+      - action: validate_cluster_version
+        params: {expected_version: "${OS_VERSION_3X:-3.8.0}"}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+      - action: validate_data_integrity
+        params: {index: overreplicated, expected_documents: 1500}
+      - action: validate_operator_status
+
+  - name: drain_mode_stall_leaves_no_exclusion
+    description: "drainDataNodes switched on and another config change applied. Documented behaviour: the restart stalls because no shard of the first candidate (nodes-2, highest ordinal first) can move anywhere. What must hold meanwhile: the candidate is not left in cluster.routing.allocation.exclude._name (a data node excluded from allocation sheds its shards onto the others until someone clears the setting by hand). EXPECTED TO FAIL while #1585 is open: PreparePodForDelete excludes the node before it can know the drain will never finish, and the exclusion is only removed after a successful pod delete. Afterwards the index is brought back to replicas: 1 so the drain can finish and the restart completes; wait_for_cluster_ready then requires exclude._name empty and allocation.enable = all."
+    steps:
+      - action: patch_cluster
+        params: {patch: {spec: {general: {drainDataNodes: true, additionalConfig: {"http.max_content_length": "160mb"}}}}}
+      - action: expect_event
+        params: {reason: RollingRestart, type: Normal, contains: "Starting rolling restart", since: 5m, timeout: 10m}
+      - action: sleep
+        params: {duration: 3m}
+      - action: check_opensearch_api
+        params: {path: "/_cluster/settings?flat_settings=true", absent: ["nodes-2"], timeout: 30s}
+      - action: check_opensearch_api
+        params: {method: PUT, path: /overreplicated/_settings, body: {index: {number_of_replicas: 1}}}
+      - action: wait_for_cluster_ready
+        params: {timeout: 25m}
+      - action: check_k8s_resource
+        params:
+          kind: opensearchclusters.opensearch.org
+          name: __CLUSTER__
+          expect: {status.componentsStatus: [{component: RollingRestart, status: Finished}]}
+      - action: check_pod_exec
+        params: {all_pods: true, command: "grep http.max_content_length config/opensearch.yml", contains: ["http.max_content_length: 160mb"]}
+      - action: validate_data_integrity
+        params: {index: overreplicated, expected_documents: 1500}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster
