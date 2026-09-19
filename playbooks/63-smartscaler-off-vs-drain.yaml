@@ -1,0 +1,73 @@
+metadata:
+  description: "confMgmt.smartScaler: false is the documented opt-out of draining: a scale-down removes the last node of the pool immediately, with a Scaler Warning ('SmartScaler is disabled: removing node from <pool> without draining'), the replicated indices go at most yellow and are re-replicated from the surviving copies with no document loss, the removed node's PVC is retained and the cluster ends RUNNING/green at 3 + 2. Flipping smartScaler back to true on the live cluster (no restart) and scaling the pool up again, the next scale-down must drain: an index with replicas: 0 whose only copies sit on the departing node keeps every document, so the drain is load-bearing rather than incidental (every other scaling playbook uses replicas: 1, where an undrained removal loses nothing)."
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          extra_spec: {confMgmt: {smartScaler: false}}
+          node_pools:
+            - {component: masters, replicas: 3, roles: ["cluster_manager"]}
+            - {component: data, replicas: 3, roles: ["data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 4000, shards: 6, replicas: 1}
+      - action: check_k8s_resource
+        params: {kind: opensearchclusters.opensearch.org, name: __CLUSTER__, expect: {spec.confMgmt.smartScaler: false}}
+
+  - name: undrained_scale_down_is_warned_and_survives_with_replicas
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 6m, min_success_ratio: 0.9}
+      - action: scale_cluster
+        params: {component: data, replicas: 2, min_health: yellow, max_unready_pods: 1}
+      - action: expect_event
+        params: {reason: Scaler, type: Warning, contains: "SmartScaler is disabled: removing node from data without draining"}
+      - action: wait_for_cluster_ready
+      - action: validate_cluster_configuration
+        params: {total_nodes: 5, roles: {cluster_manager: 3, data: 2}}
+      - action: check_k8s_resource
+        params: {kind: pvc, name: data-__CLUSTER__-data-2}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 4000}
+      - action: validate_operator_status
+
+  - name: drained_scale_down_keeps_sole_shard_copies
+    description: "smartScaler: true set on the live cluster (no pod restart, confMgmt is not part of the pod template), pool scaled back to 3 (the retained PVC is reused), an index with replicas: 0 placed so that the departing node holds some of its only copies; the scale-down must exclude and drain that node first: no sample ever shows fewer documents, health >= yellow, node gone, exclude._name cleared."
+    steps:
+      - action: patch_cluster
+        params: {patch: {spec: {confMgmt: {smartScaler: true}}}}
+      - action: check_k8s_resource
+        params: {kind: opensearchclusters.opensearch.org, name: __CLUSTER__, expect: {spec.confMgmt.smartScaler: true}}
+      - action: scale_cluster
+        params: {component: data, replicas: 3, min_health: yellow}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: sole-copies, count: 3000, shards: 6, replicas: 0}
+      - action: check_opensearch_api
+        params: {path: "/_cat/shards/sole-copies?format=json&h=node,prirep,state", contains: ["data-2"]}
+      - action: index_documents
+        background: true
+        params: {index: data-live2, count: 200, replicas: 1, duration: 8m, min_success_ratio: 0.9}
+      - action: scale_cluster
+        params: {component: data, replicas: 2, min_health: yellow, max_unready_pods: 1, indices: [sole-copies, data-a]}
+      - action: wait_for_cluster_ready
+      - action: validate_cluster_configuration
+        params: {total_nodes: 5, roles: {cluster_manager: 3, data: 2}}
+      - action: check_opensearch_api
+        params: {path: "/_cat/shards/sole-copies?format=json&h=node,prirep,state", absent: ["data-2", "UNASSIGNED"]}
+      - action: validate_data_integrity
+        params: {index: sole-copies, expected_documents: 3000}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 4000}
+      - action: validate_node_configuration
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster
