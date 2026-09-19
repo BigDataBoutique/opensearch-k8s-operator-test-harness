@@ -14,7 +14,7 @@ from oko_test_harness import k8s
 from oko_test_harness.actions.base import BaseAction, parse_duration
 from oko_test_harness.actions.cluster import DeployClusterAction, sh
 from oko_test_harness.actions.features import _Placeholders
-from oko_test_harness.actions.scaling import _ScaleBase
+from oko_test_harness.actions.scaling import _ScaleBase, pool_node_names
 from oko_test_harness.actions.validation import operator_invariant_violations
 from oko_test_harness.models.playbook import ActionResult
 
@@ -297,7 +297,7 @@ class EditNodePoolsAction(_ScaleBase):
     def execute(self, params):
         cr = self.cr()
         removed = set(params.get("remove") or [])
-        removed_replicas = sum(p["replicas"] for p in cr["spec"]["nodePools"] if p["component"] in removed)
+        removed_nodes = [n for p in cr["spec"]["nodePools"] if p["component"] in removed for n in pool_node_names(self.cluster, p["component"], 0, p["replicas"])]
         pools = [p for p in cr["spec"]["nodePools"] if p["component"] not in removed]
         for up in params.get("update") or []:
             pool = next((p for p in pools if p["component"] == up["component"]), None)
@@ -317,7 +317,7 @@ class EditNodePoolsAction(_ScaleBase):
         time.sleep(obs.interval)
         # removed pools go away as a whole and may overlap with a rolling restart of updated pools (see findings N19):
         # judge by health, document counts and total members lost, not by per-sample drops
-        return self.apply_and_wait(cr, obs, msg, sum(p["replicas"] for p in pools), params, removed=removed_replicas, step_drop=None)
+        return self.apply_and_wait(cr, obs, msg, sum(p["replicas"] for p in pools), params, removed=removed_nodes, step_drop=None)
 
 
 class PausePodsAction(BaseAction):

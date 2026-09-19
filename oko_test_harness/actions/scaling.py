@@ -4,7 +4,7 @@ whole array). Changing replicas patches just that pool's field: a full write wou
 concurrently by another step (playbook 31 scales and upgrades in the same window)."""
 
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from oko_test_harness import k8s
 from oko_test_harness.actions.base import BaseAction
@@ -21,8 +21,16 @@ def replicas_patch_ops(pools: List[Dict[str, Any]], component: str, replicas: in
     ]
 
 
+def pool_node_names(cluster: str, component: str, start: int, stop: int) -> List[str]:
+    """Node (= pod) names of ordinals [start, stop) in a pool: the members a scale-down or pool removal takes away."""
+    return [f"{cluster}-{component}-{i}" for i in range(start, stop)]
+
+
 class _ScaleBase(BaseAction):
-    def apply_and_wait(self, cr, obs, message: str, expected_nodes: int, params, removed: int = 0, step_drop: Optional[int] = 1, write=None):
+    def apply_and_wait(self, cr, obs, message: str, expected_nodes: int, params, removed: Iterable[str] = (), step_drop: Optional[int] = 1, write=None):
+        # `removed` names the members this change is meant to take away; the observer lets exactly those leave without
+        # counting, so any other member leaving during the operation is an unplanned departure (a concurrent restart).
+        obs.expected_removals = set(removed)
         # `write` lets a caller narrow the write to the fields it owns; the default full read-modify-write
         # loses any spec change another step made since self.cr() was read (see ScaleClusterAction).
         (write or (lambda: k8s.replace_cr(cr)))()
@@ -44,8 +52,9 @@ class _ScaleBase(BaseAction):
         self.wait_cluster_running(self.timeout(self.config.timeouts.scaling))
         k8s.wait_for("cluster settled", settled, self.timeout(self.config.timeouts.scaling), 10)
         # scale-ups: new pods are unready while they start, so judge by cluster members lost instead of unready pods;
-        # scale-downs may lose exactly `removed` members overall but only one between consecutive samples
-        return self.finish_observed(obs, message, params.get("min_health", "yellow"), params.get("max_unready_pods"), max_nodes_down=params.get("max_nodes_down", max(1, removed)), max_step_drop=step_drop)
+        # scale-downs: the `removed` members leave by design, and at most one *other* member may be out at a time (the
+        # operator's follow-up rolling restart) -- two unplanned departures in one window is the N29 bug, not a wider budget
+        return self.finish_observed(obs, message, params.get("min_health", "yellow"), params.get("max_unready_pods"), max_nodes_down=params.get("max_nodes_down", 1), max_step_drop=step_drop)
 
 
 class ScaleClusterAction(_ScaleBase):
@@ -67,7 +76,7 @@ class ScaleClusterAction(_ScaleBase):
         pool["replicas"] = new
         expected = sum(p["replicas"] for p in cr["spec"]["nodePools"])
         result = self.apply_and_wait(
-            cr, obs, f"Scaled pool {component} {old} -> {new}", expected, params, removed=max(0, old - new),
+            cr, obs, f"Scaled pool {component} {old} -> {new}", expected, params, removed=pool_node_names(self.cluster, component, new, old),
             write=lambda: k8s.patch_json(self.cr_resource(), self.cluster, self.namespace, ops),
         )
         if result.success and new < old:
@@ -123,5 +132,5 @@ class RemoveNodePoolAction(_ScaleBase):
         # a removed pool's StatefulSet is deleted as a whole, so all its members leave at once (no one-at-a-time drain)
         return self.apply_and_wait(
             cr, obs, f"Removed node pool {pool['component']} ({pool['replicas']} nodes)", expected,
-            {**params, "max_unready_pods": params.get("max_unready_pods", pool["replicas"])}, removed=pool["replicas"], step_drop=None,
+            {**params, "max_unready_pods": params.get("max_unready_pods", pool["replicas"])}, removed=pool_node_names(self.cluster, pool["component"], 0, pool["replicas"]), step_drop=None,
         )

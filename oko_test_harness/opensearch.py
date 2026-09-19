@@ -103,6 +103,10 @@ class OpenSearchClient:
     def nodes(self) -> Dict[str, Dict[str, Any]]:
         return self.get("/_nodes/_all/os,roles,plugins").get("nodes", {})
 
+    def node_names(self) -> List[str]:
+        """Current cluster members by node name (= pod name for operator-managed clusters)."""
+        return [n["name"] for n in self.get("/_cat/nodes?format=json&h=name")]
+
     def plugins(self) -> Dict[str, List[str]]:
         """node name -> installed plugin names."""
         return {n["name"]: [p["name"] for p in n.get("plugins", [])] for n in self.nodes().values()}

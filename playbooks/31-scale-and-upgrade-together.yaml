@@ -44,7 +44,7 @@ phases:
       - action: validate_operator_status
 
   - name: scale_down_and_upgrade_together
-    description: "The reverse order on a busier cluster: a scale-down (drain) is requested moments before a config change. The drained node must not be taken as the rolling-restart candidate while it still holds shards, and the removal must not coincide with another pod going down. EXPECTED TO FAIL while round-3 N29 stands: the scale-down itself starts a whole-pool restart and the removed node's neighbour is killed one second after it (6 -> 4 members)."
+    description: "The reverse order on a busier cluster: a scale-down (drain) and a config change are requested together. The operator must serialise them: the drained node is excluded, emptied and removed first (the Scaler only shrinks once it holds no shards), then the rolling restart replaces the survivors one at a time (#1572). Asserted: the removed data node's own departure is planned, at most one *unplanned* member is down at a time, health >= yellow under live indexing, no data loss, final topology 3 managers + 2 data (5 nodes), allocation settings restored, RUNNING with no dangling component status."
     steps:
       - action: index_documents
         background: true

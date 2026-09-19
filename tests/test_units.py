@@ -71,6 +71,37 @@ def test_observer_violations():
     assert obs.violations(min_health="red", max_unready_pods=None, allow_doc_loss=True) == []
 
 
+def test_observer_scale_down_invariant():
+    """The node a scale-down is meant to remove may leave without counting; every other departure is unplanned and at most one
+    may happen per sample window and be missing at once. Playbook 31, 2026-09-18: data-2 drained and removed, data-0 rolled two
+    seconds later (6 -> 4 between two samples) is correct operator behaviour; two nodes both leaving unexpectedly is N29."""
+    six = [f"os-masters-{i}" for i in range(3)] + [f"os-data-{i}" for i in range(3)]
+
+    def observed(expected, *memberships):
+        obs = ClusterObserver(lambda: None, "ns", "c")
+        obs.expected_removals = set(expected)
+        for names in memberships:
+            obs.record_nodes(names)
+        return obs
+
+    budget = dict(max_nodes_down=1, max_step_drop=1, max_unready_pods=None)
+    # 6 -> 4 with data-2 expected to go and data-0 rolled: within budget
+    obs = observed(["os-data-2"], six, [n for n in six if n not in ("os-data-2", "os-data-0")], six)
+    assert obs.violations(**budget) == [] and obs.unplanned_departures == {"os-data-0"} and obs.max_step_drop == 1 and obs.max_unplanned_down == 1
+    # the same 6 -> 4 with nothing planned: two unplanned departures in one window and two missing at once
+    v = observed([], six, [n for n in six if n not in ("os-data-2", "os-data-0")]).violations(**budget)
+    assert len(v) == 2 and "2 cluster members left unexpectedly" in v[0] and "2 cluster members were down at once" in v[1] and "os-data-2" in v[0]
+    # 6 -> 3 with one planned removal: still two unplanned
+    v = observed(["os-data-2"], six, [n for n in six if n not in ("os-data-2", "os-data-0", "os-masters-1")]).violations(**budget)
+    assert len(v) == 2 and "2 cluster members left unexpectedly" in v[0]
+    # 6 -> 4 where the planned node is still there and two *other* nodes left (N29 proper): the budget is by identity, not count
+    v = observed(["os-data-2"], six, [n for n in six if n not in ("os-data-0", "os-data-1")]).violations(**budget)
+    assert len(v) == 2 and "planned: ['os-data-2']" in v[0]
+    # one at a time is fine even when the total drop over the operation matches: data-2 leaves, then data-0 leaves after it is back
+    obs = observed(["os-data-2"], six, [n for n in six if n != "os-data-2"], [n for n in six if n not in ("os-data-2", "os-data-0")], [n for n in six if n != "os-data-2"])
+    assert obs.violations(**budget) == [] and obs.summary()["min_nodes"] == 4 and obs.summary()["baseline_nodes"] == 6
+
+
 def test_all_playbooks_validate():
     actions = PlaybookExecutor().actions
     from pathlib import Path
