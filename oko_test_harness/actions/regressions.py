@@ -17,6 +17,7 @@ from oko_test_harness.actions.features import _Placeholders
 from oko_test_harness.actions.scaling import _ScaleBase, pool_node_names
 from oko_test_harness.actions.validation import operator_invariant_violations
 from oko_test_harness.models.playbook import ActionResult
+from oko_test_harness.opensearch import health_at_least
 
 MASTER_ROLES = ("cluster_manager", "master")
 
@@ -52,6 +53,25 @@ def voting_config_problems(client, manager_pods: List[str]) -> Tuple[List[str], 
 def green(client) -> bool:
     h = client.health()
     return h["status"] == "green" and not h["relocating_shards"]
+
+
+def settled_at_least(client, target: str) -> bool:
+    """Health >= target with no shard movement: what "done" looks like on a cluster that can never be green."""
+    h = client.health()
+    return health_at_least(h["status"], target) and not h["relocating_shards"] and not h["initializing_shards"]
+
+
+def pods_matching(pods: List[Dict[str, Any]], names: List[str], state: str) -> List[str]:
+    """Names (of `names`) whose pod is in `state`: `ready` (present, ready, not terminating), `not_ready` (absent,
+    terminating or not ready: a member the cluster is missing) or `gone` (no pod object at all)."""
+    by_name = {p["name"]: p for p in pods}
+    if state == "ready":
+        return [n for n in names if n in by_name and by_name[n]["ready"] and not by_name[n]["deletion"]]
+    if state == "not_ready":
+        return [n for n in names if n not in by_name or by_name[n]["deletion"] or not by_name[n]["ready"]]
+    if state == "gone":
+        return [n for n in names if n not in by_name]
+    raise ValueError(f"unknown pod state {state!r}; use ready, not_ready or gone")
 
 
 def unreachable_for(obs) -> float:
@@ -201,10 +221,12 @@ class RollingRestartAction(BaseAction):
     """Trigger a rolling restart through a spec change (`patch` = merge patch on the CR and/or `node_pool` =
     {component, ...fields}) and watch it: every pod of `expect_pools` (default: all) must be replaced, pods of other pools
     untouched, at most `max_unready_pods` (1) down at a time, health >= `min_health`, no document loss, and afterwards the
-    operator RUNNING with allocation settings restored (#1471, #1369, #1450; never completes on one manager: #1449)."""
+    operator RUNNING with allocation settings restored (#1471, #1369, #1450; never completes on one manager: #1449).
+    `final_health` (green) is the health the cluster must settle at afterwards: yellow for a cluster whose replicas can
+    never all be assigned (#1424), where the restart must still complete."""
 
     action_name = "rolling_restart"
-    params = {"patch", "node_pool", "expect_pools", "min_health", "max_unready_pods", "indices"}
+    params = {"patch", "node_pool", "expect_pools", "min_health", "max_unready_pods", "indices", "final_health"}
 
     def execute(self, params):
         before = {p["name"]: p for p in self.pods() if p["labels"].get(k8s.NODEPOOL_LABEL)}
@@ -244,8 +266,9 @@ class RollingRestartAction(BaseAction):
         if touched:
             obs.stop()
             return ActionResult(False, f"pods outside {pools} were restarted too: {touched}", obs.summary())
+        final_health = params.get("final_health", "green")
         with self.os_client() as c:
-            k8s.wait_for("health green", lambda: green(c), max(60, int(deadline - time.time())), 10)
+            k8s.wait_for(f"health {final_health}", lambda: green(c) if final_health == "green" else settled_at_least(c, final_health), max(60, int(deadline - time.time())), 10)
             violations = operator_invariant_violations(c, self.cr(), self.pods())
         result = self.finish_observed(obs, f"Rolling restart of {sorted(must)} completed", params.get("min_health", "yellow"), params.get("max_unready_pods", 1))
         if result.success and violations:
@@ -429,3 +452,66 @@ class CreateNamespaceAction(BaseAction):
     def execute(self, params):
         k8s.ensure_namespace(self.namespace)
         return ActionResult(True, f"Namespace {self.namespace} ready")
+
+
+class WaitForPodStateAction(BaseAction, _Placeholders):
+    """Wait until `count` (1) pods are in `state`: `ready`, `not_ready` (absent, terminating or not ready, i.e. a
+    member the cluster is missing) or `gone`. Pods are named by `name` (placeholders allowed) or by `component`, whose
+    members are `<cluster>-<component>-0..n-1` with n from the CR (or `ordinals`, to keep judging the pre-scale-down
+    size of a pool whose replicas were just lowered). `ready` without `count` means every member. Lets a foreground step
+    strike at a precise moment of a background operation (a pod of the pool is down: #1590), or wait for the
+    StatefulSet to bring a pod back while the operator is scaled to zero. `never: true` inverts it: the state must not
+    be reached by `count` pods at any sample for the whole `timeout` (5m), e.g. never two members of a pool absent at
+    once."""
+
+    action_name = "wait_for_pod_state"
+    params = {"component", "name", "state", "count", "ordinals", "never"}
+
+    def execute(self, params):
+        state = params.get("state", "not_ready")
+        component = params.get("component")
+        if params.get("name"):
+            names = [self.sub(params["name"])]
+        elif component:
+            if params.get("ordinals"):
+                n = int(params["ordinals"])
+            else:
+                pool = next((p for p in self.cr()["spec"]["nodePools"] if p["component"] == component), None)
+                if pool is None:
+                    return ActionResult(False, f"No node pool {component}")
+                n = int(pool["replicas"])
+            names = [f"{self.cluster}-{component}-{i}" for i in range(n)]
+        else:
+            return ActionResult(False, "wait_for_pod_state needs `name` or `component`")
+        need = int(params["count"]) if "count" in params else (len(names) if state == "ready" else 1)
+        what = f"{need} of {names} {state}"
+
+        def check():
+            matched = pods_matching(self.pods(component), names, state)
+            if len(matched) < need:
+                raise Exception(f"{len(matched)}/{need} pods {state}: {matched}")
+            return matched
+
+        if params.get("never"):
+            deadline = time.time() + self.timeout("5m")
+            while time.time() < deadline:
+                try:
+                    matched = check()
+                    return ActionResult(False, f"{len(matched)} pods {state} at once, which must never happen: {matched}")
+                except Exception:  # noqa: BLE001 - the state is not reached, keep watching
+                    time.sleep(3)
+            return ActionResult(True, f"Never {what} during the whole watch")
+        matched = k8s.wait_for(what, check, self.timeout("10m"), 3)
+        return ActionResult(True, f"Pods {state}: {matched}")
+
+
+class SleepAction(BaseAction):
+    """Wait `duration` (1m) for a state the operator exposes no signal for (e.g. a stall that only reaches its log)."""
+
+    action_name = "sleep"
+    params = {"duration"}
+
+    def execute(self, params):
+        d = parse_duration(params.get("duration", "1m"))
+        time.sleep(d)
+        return ActionResult(True, f"Slept {d}s")

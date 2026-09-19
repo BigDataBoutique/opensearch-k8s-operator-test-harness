@@ -136,3 +136,41 @@ def test_feature_matchers():
     assert not matches(body["index_templates"], [{"name": "b"}])
     assert mismatches(body, {"status.phase": "RUNNING", "n": "3"}) == []  # scalars compare as strings too
     assert mismatches(body, {"status.missing": 1, "n": 4}) == ["status.missing missing (expected 1)", "n=3 expected 4"]
+
+
+def test_pods_matching_states():
+    """wait_for_pod_state judges a pool by its member names: an absent or terminating pod is a member the cluster is
+    missing (not_ready), only a pod object that does not exist at all is gone."""
+    from oko_test_harness.actions.regressions import pods_matching
+
+    pod = lambda name, ready=True, deletion=False: {"name": name, "ready": ready, "deletion": deletion}  # noqa: E731
+    pods = [pod("c-data-0"), pod("c-data-1", ready=False), pod("c-data-2", deletion=True)]
+    names = ["c-data-0", "c-data-1", "c-data-2", "c-data-3"]
+    assert pods_matching(pods, names, "ready") == ["c-data-0"]
+    assert pods_matching(pods, names, "not_ready") == ["c-data-1", "c-data-2", "c-data-3"]
+    assert pods_matching(pods, names, "gone") == ["c-data-3"]
+    with pytest.raises(ValueError):
+        pods_matching(pods, names, "terminating")
+
+
+def test_new_actions_registered():
+    actions = PlaybookExecutor().actions
+    assert actions["wait_for_pod_state"].params == {"component", "name", "state", "count", "ordinals", "never"}
+    assert actions["sleep"].params == {"duration"}
+    assert "final_health" in actions["rolling_restart"].params
+
+
+def test_settled_at_least():
+    from oko_test_harness.actions.regressions import settled_at_least
+
+    class C:
+        def __init__(self, h):
+            self.h = h
+
+        def health(self):
+            return self.h
+
+    assert settled_at_least(C({"status": "yellow", "relocating_shards": 0, "initializing_shards": 0}), "yellow")
+    assert not settled_at_least(C({"status": "yellow", "relocating_shards": 0, "initializing_shards": 1}), "yellow")
+    assert not settled_at_least(C({"status": "red", "relocating_shards": 0, "initializing_shards": 0}), "yellow")
+    assert settled_at_least(C({"status": "green", "relocating_shards": 0, "initializing_shards": 0}), "yellow")
