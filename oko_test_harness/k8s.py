@@ -66,6 +66,12 @@ def operator_crs(namespace: Optional[str] = None) -> List[str]:
     return found
 
 
+def foreign_clusters(namespace: str) -> List[str]:
+    """OpenSearchCluster objects (either API group) living outside `namespace`: another playbook's live cluster, which
+    shares the operator Deployment with this one."""
+    return [entry for entry in operator_crs() if entry.startswith("opensearchclusters.") and entry.split(" ", 1)[1].split("/", 1)[0] != namespace]
+
+
 def strip_operator_finalizers(namespace: str) -> List[str]:
     """Remove finalizers from every operator CR in a namespace that is already being deleted, so a namespace or CRD
     deletion cannot deadlock once the operator is gone (N23). Cleanup only: never call this while asserting on the operator."""

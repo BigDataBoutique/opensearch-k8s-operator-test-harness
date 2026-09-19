@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Run every playbook in ../playbooks/, in parallel where it's safe to. Stdlib only.
+"""Run every playbook in ../playbooks/, in parallel where it's safe to. Stdlib only (PyYAML is used
+to read playbook steps when importable, with a regex fallback).
 
 Discovers playbooks dynamically (no hand-maintained lane lists to rebalance every time one is
 added or removed — a recurring source of drift in scripts/run-suite.sh). Three phases:
@@ -8,10 +9,17 @@ added or removed — a recurring source of drift in scripts/run-suite.sh). Three
                     `k3d image import` race happens (RUNNING.md section 4).
   2. pool        : everything else except the migration playbooks, up to CONCURRENCY at a time
                     (default 2 — see RUNNING.md section 1 for why that ceiling exists).
-  3. solo        : the migration/operator-upgrade playbooks (`50-55`, `62`), one at a time, in
-                    the tested-safe order from RUNNING.md section 4b. These replace the shared
-                    operator and refuse to start while any OpenSearchCluster exists, so they can
-                    never overlap with anything else.
+  3. solo        : one at a time. First every playbook whose steps touch the shared operator
+                    Deployment (`scale_operator`, `kill_operator`, `upgrade_operator`, or an
+                    `install_operator` that is not the plain idempotent `version: local` install --
+                    derived from the playbook's steps, so a new playbook cannot regress it; a
+                    playbook can also opt in with `metadata.run_alone: true`), then the migration/
+                    operator-upgrade playbooks (`50-55`, `62`) in the tested-safe order from
+                    RUNNING.md section 4b. An operator restart under a parallel lane restarts the
+                    reconcile of every other lane's cluster and loses its operator log (2026-09-18:
+                    playbook 76's scale_operator restarted the operator under playbook 31's rolling
+                    restart), and the migration playbooks replace the operator outright and refuse
+                    to start while any OpenSearchCluster exists.
 
 A background supervisor thread watches every running/finished playbook and only calls out to
 Claude Code (`claude -p`, read-only tools) in three situations:
@@ -77,6 +85,11 @@ import sys
 import threading
 import time
 
+try:
+    import yaml
+except ImportError:  # the runner stays usable outside the poetry env; the regex fallback below covers the plan
+    yaml = None
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLAYBOOKS_DIR = os.path.join(ROOT, "playbooks")
 LOGS_DIR = os.path.join(ROOT, "logs")
@@ -96,9 +109,84 @@ SUPERVISE_SECS = 30  # how often the supervisor scans for stuck/finished playboo
 
 # Migration / operator-upgrade playbooks: they replace the shared operator and refuse to run
 # while any OpenSearchCluster exists (RUNNING.md section 4b) -- must never overlap with anything.
-SOLO_PATTERNS = [re.compile(r"^5[0-5]-"), re.compile(r"^62-")]
+MIGRATION_PATTERNS = [re.compile(r"^5[0-5]-"), re.compile(r"^62-")]
 SOLO_ORDER = ["51", "50", "52", "54", "55", "62", "53"]  # tested-safe order; 53 last (toggles legacyAPI)
 BUILD_FIRST_PREFIX = "10-"  # if present, run alone first (builds/imports the operator image)
+# Actions that restart, replace or reconfigure the shared operator Deployment. A playbook containing any of
+# them runs solo: under a parallel lane the restart interrupts every other lane's reconcile and loses the
+# operator log of the window they are asserting on. `install_operator` is special-cased in operator_steps().
+OPERATOR_ACTIONS = {"scale_operator", "kill_operator", "upgrade_operator"}
+INSTALL_OPERATOR_REPLACING_PARAMS = {"values", "values_file", "legacy_api", "build_ref"}
+
+
+def _install_operator_reason(params):
+    """The plain `install_operator` (no params, or `version: local` alone) that starts every playbook is idempotent:
+    it returns early when the local chart+image are already running. Anything else runs helm and rolls the operator."""
+    params = params or {}
+    version = str(params.get("version", "local"))
+    extra = sorted(INSTALL_OPERATOR_REPLACING_PARAMS & set(params))
+    if version == "local" and not extra:
+        return None
+    return "install_operator(" + ", ".join(([f"version={version}"] if version != "local" else []) + extra) + ")"
+
+
+_ACTION_LINE = re.compile(r"^(\s*)-\s*action:\s*['\"]?([A-Za-z_]\w*)")
+_INSTALL_PARAM = re.compile(r"\b(values_file|values|legacy_api|build_ref)\s*:")
+_INSTALL_VERSION = re.compile(r"\bversion\s*:\s*['\"]?((?:\$\{[^}]*\}|[^'\",}\s])+)")  # `${VAR:-default}` keeps its closing brace
+
+
+def _steps_from_yaml(text):
+    data = yaml.safe_load(text) or {}
+    steps = [dict(step) for phase in data.get("phases") or [] for step in phase.get("steps") or []]
+    flag = bool((data.get("metadata") or {}).get("run_alone"))
+    return steps, flag
+
+
+def _steps_from_text(text):
+    """Fallback without PyYAML: `- action: x` lines, with the lines up to the next step scanned for install_operator params."""
+    lines = text.splitlines()
+    steps = []
+    for i, line in enumerate(lines):
+        m = _ACTION_LINE.match(line)
+        if not m:
+            continue
+        block = []
+        for nxt in lines[i + 1:]:
+            if _ACTION_LINE.match(nxt) or re.match(r"^\s*-\s*name:", nxt) or re.match(r"^\S", nxt):
+                break
+            block.append(nxt.split("#", 1)[0])
+        params = {}
+        if m.group(2) == "install_operator":
+            body = "\n".join(block)
+            params = {k: True for k in _INSTALL_PARAM.findall(body)}
+            v = _INSTALL_VERSION.search(body)
+            if v:
+                params["version"] = v.group(1)
+        steps.append({"action": m.group(2), "params": params})
+    flag = bool(re.search(r"^\s+run_alone\s*:\s*true\s*$", text, re.M | re.I))
+    return steps, flag
+
+
+def operator_steps(path):
+    """Reasons this playbook must run alone: the operator-affecting steps it contains (as short labels) and/or
+    the explicit `metadata.run_alone` flag. Empty list = safe to run in the parallel pool."""
+    with open(path) as f:
+        text = f.read()
+    steps, flag = _steps_from_yaml(text) if yaml else _steps_from_text(text)
+    reasons = []
+    for step in steps:
+        action = step.get("action")
+        if action == "install_operator":
+            reason = _install_operator_reason(step.get("params"))
+        elif action in OPERATOR_ACTIONS:
+            reason = action
+        else:
+            reason = None
+        if reason and reason not in reasons:
+            reasons.append(reason)
+    if flag:
+        reasons.append("metadata.run_alone")
+    return reasons
 
 ANOMALY_PATTERNS = [re.compile(p, re.I) for p in [
     r"\bpanic\b", r"dpanic", r"OOMKilled", r"leader election lost",
@@ -191,6 +279,8 @@ class Playbook:
         self.last_diagnosed = 0
         self.finalized = False
         self.namespace = None
+        self.migration = any(pat.match(self.name) for pat in MIGRATION_PATTERNS)
+        self.solo_reasons = []  # why classify() put it in the solo group (empty = parallel pool)
 
     @property
     def running(self):
@@ -263,17 +353,29 @@ def discover_playbooks():
 
 
 def classify(pbs):
+    """(build_first, pool, solo). A playbook is solo when it is a migration playbook (name pattern), when its steps
+    touch the shared operator (operator_steps()), or when it sets metadata.run_alone. Non-migration solo playbooks
+    come first (by name), then the migration ones in SOLO_ORDER, so a failed migration playbook's leftover chart
+    never bleeds into the others."""
     build_first = [p for p in pbs if p.name.startswith(BUILD_FIRST_PREFIX)]
     rest = [p for p in pbs if p not in build_first]
-    solo = [p for p in rest if any(pat.match(p.name) for pat in SOLO_PATTERNS)]
+    for p in rest:
+        p.solo_reasons = (["migration"] if p.migration else []) + operator_steps(p.path)
+    solo = [p for p in rest if p.solo_reasons]
     pool = [p for p in rest if p not in solo]
 
     def solo_key(p):
         prefix = p.name.split("-")[0]
-        return (SOLO_ORDER.index(prefix) if prefix in SOLO_ORDER else len(SOLO_ORDER), p.name)
+        if not p.migration:
+            return (0, 0, p.name)
+        return (1, SOLO_ORDER.index(prefix) if prefix in SOLO_ORDER else len(SOLO_ORDER), p.name)
 
     solo.sort(key=solo_key)
     return build_first, pool, solo
+
+
+def solo_label(p):
+    return f"{p.name} ({', '.join(p.solo_reasons)})"
 
 
 # ---------------------------------------------------------------------------
@@ -470,11 +572,20 @@ def orchestrate(build_first, pool, solo, stop_event):
         log_event(f"phase pool: {len(pool)} playbooks, concurrency={CONCURRENCY}")
         run_pool(pool, CONCURRENCY)
 
-    if solo:
-        log_event("cleanup: clearing namespaces before the solo/migration phase")
+    solo_ops = [p for p in solo if not p.migration]
+    migration = [p for p in solo if p.migration]
+    if solo_ops:
+        # nothing else may run while these restart/scale the shared operator; leftovers from the pool are still
+        # harmless to them, but clearing now keeps IO pressure down (RUNNING.md section 4)
+        log_event("cleanup: clearing namespaces before the solo (operator-affecting) phase")
         run_capture(["poetry", "run", "oko-test", "cleanup"], timeout=120)
-        log_event(f"phase solo: {[p.name for p in solo]}")
-        run_solo(solo)
+        log_event(f"phase solo: {[solo_label(p) for p in solo_ops]}")
+        run_solo(solo_ops)
+    if migration:
+        log_event("cleanup: clearing namespaces before the migration phase")
+        run_capture(["poetry", "run", "oko-test", "cleanup"], timeout=120)
+        log_event(f"phase migration: {[p.name for p in migration]}")
+        run_solo(migration)
 
     # give the supervisor one more sweep to catch the last finished playbook before stopping it, then
     # a short buffer for that in-progress sweep to finish *starting* any last diagnosis thread, then
@@ -498,7 +609,7 @@ def start_trace(build_first, pool, solo):
 - concurrency: {CONCURRENCY}
 - build-first: {[p.name for p in build_first]}
 - pool ({len(pool)}): {[p.name for p in pool]}
-- solo ({len(solo)}): {[p.name for p in solo]}
+- solo ({len(solo)}): {[solo_label(p) for p in solo]}
 
 ## Timeline
 """)
@@ -534,7 +645,9 @@ def print_summary(all_pbs):
 def print_plan(build_first, pool, solo):
     print(f"Build-first ({len(build_first)}): {[p.name for p in build_first]}")
     print(f"Parallel pool, concurrency={CONCURRENCY} ({len(pool)}): {[p.name for p in pool]}")
-    print(f"Solo/sequential ({len(solo)}): {[p.name for p in solo]}")
+    print(f"Solo/sequential ({len(solo)}):")
+    for p in solo:
+        print(f"  {solo_label(p)}")
 
 
 # ---------------------------------------------------------------------------

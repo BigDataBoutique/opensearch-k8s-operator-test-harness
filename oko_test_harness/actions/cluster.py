@@ -168,6 +168,15 @@ class InstallOperatorAction(BaseAction):
         return ActionResult(True, f"Operator {version} installed in {ns} ({[p['image'] for p in pods]})", {"image": pods[0]["image"] if pods else None})
 
 
+def refuse_if_foreign_clusters(namespace: str, what: str) -> None:
+    """Fail fast before restarting the shared operator while another playbook's cluster exists: the restart interrupts that
+    cluster's reconcile mid-operation and loses the operator log it is asserting on (2026-09-18, playbook 76 under 31).
+    The runner puts every playbook with such a step in the solo group; this is the backstop for manual/lane runs."""
+    others = k8s.foreign_clusters(namespace)
+    if others:
+        raise RuntimeError(f"cannot {what} while OpenSearchCluster objects exist outside {namespace}: {others}; the operator Deployment is shared, so this playbook must run alone")
+
+
 def wait_operator_rollout(release: str, ns: str, local_image: Optional[str], timeout: int = 600) -> None:
     """kubectl rollout status, but a locally imported image that kubelet image GC removed meanwhile is re-imported and the pod recreated."""
     deadline = time.time() + timeout

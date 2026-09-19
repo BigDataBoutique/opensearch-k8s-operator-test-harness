@@ -18,8 +18,8 @@ takes ~1.5 min; later runs reuse the image (tag = git sha + diff hash) and skip 
 ## 1. How to run
 
 **Automated (recommended):** `poetry run python runner/oko_runner.py` discovers every playbook, runs the
-image-build one first, fans the rest out in parallel (default 2 at a time), then runs the migration
-playbooks alone at the end (see section 4b) — see `runner/oko_runner.py`'s docstring for env vars
+image-build one first, fans the rest out in parallel (default 2 at a time), then runs the operator-affecting
+and migration playbooks alone at the end (see section 4b) — see `runner/oko_runner.py`'s docstring for env vars
 (`CONCURRENCY`, `DRY_RUN=1` to preview the plan, etc). It arms its own stuck/anomaly detection (section 2)
 and only calls out to Claude Code when something needs a human-grade look, and writes a trace log designed
 to be handed to a fresh Claude Code session afterward for a final sanity check. Prefer this for a full-suite run.
@@ -39,9 +39,13 @@ nohup scripts/run-suite.sh >/dev/null 2>&1 &
 
 Concurrency: **at most 2 playbooks at a time** on a laptop-class box (three clusters booting at once pushed IO pressure above 50% and made containerd miss stop deadlines); the migration playbooks
 must run **alone**, one at a time (they replace the shared operator with a released 2.x chart and upgrade it
-back to the local build — `install_operator` refuses to run while any `OpenSearchCluster` exists). Every
+back to the local build — `install_operator` refuses to run while any `OpenSearchCluster` exists). The same
+rule applies to any playbook with a step that restarts or reconfigures the shared operator Deployment
+(`scale_operator`, `kill_operator`, `upgrade_operator`, or an `install_operator` beyond the plain `version: local`):
+the runner derives that from the steps (or `metadata.run_alone: true`) and schedules it solo, and `scale_operator`/
+`kill_operator` refuse to run while another namespace holds an `OpenSearchCluster`. Every
 playbook uses its own random namespace and cluster name, and `install_operator` is idempotent, so
-non-migration playbooks can freely share the k3d cluster and the operator with each other.
+all other playbooks can freely share the k3d cluster and the operator with each other.
 
 Typical durations when images are cached and IO is quiet: basic playbooks 2-3 min, upgrades 10-20 min,
 scaling ~15 min, chaos ~15 min. A step that runs longer than its timeout is almost always a real hang; the

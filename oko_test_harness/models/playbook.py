@@ -20,6 +20,7 @@ class Metadata:
     name: Optional[str] = None
     description: Optional[str] = None
     tags: List[str] = field(default_factory=list)
+    run_alone: bool = False  # runner/oko_runner.py: never overlap with another playbook (steps touching the operator imply this)
 
 
 @dataclass

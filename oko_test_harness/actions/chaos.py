@@ -8,7 +8,7 @@ import time
 
 from oko_test_harness import k8s
 from oko_test_harness.actions.base import BaseAction, parse_duration
-from oko_test_harness.actions.cluster import operator_pods, sh
+from oko_test_harness.actions.cluster import operator_pods, refuse_if_foreign_clusters, sh
 from oko_test_harness.models.playbook import ActionResult
 
 
@@ -98,6 +98,7 @@ class ScaleOperatorAction(BaseAction):
         from oko_test_harness.actions.cluster import operator_deployment
 
         ns, n = self.config.opensearch.operator_namespace, int(params["replicas"])
+        refuse_if_foreign_clusters(self.namespace, f"scale the operator to {n}")
         k8s.kubectl("scale", f"deployment/{operator_deployment(self.config.opensearch.operator_release, ns)}", "-n", ns, f"--replicas={n}")
         k8s.wait_for(f"operator at {n} replicas", lambda: len([p for p in operator_pods(ns) if p["ready"] and not p["deletion"]]) == n and len(operator_pods(ns)) == n, self.timeout("5m"), 5)
         return ActionResult(True, f"Operator scaled to {n} replica(s)")
@@ -113,6 +114,7 @@ class KillOperatorAction(BaseAction):
         if params.get("delay"):
             time.sleep(parse_duration(params["delay"]))
         ns = self.config.opensearch.operator_namespace
+        refuse_if_foreign_clusters(self.namespace, "kill the operator")
         pods = operator_pods(ns)
         if not pods:
             return ActionResult(False, "No operator pod found")

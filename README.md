@@ -51,7 +51,7 @@ On failure the harness always dumps operator logs, the CR, pods, PVCs, events an
 | `23-upgrade-abort` | Unpullable target version gets stuck; reverting the spec recovers; a real upgrade works afterwards |
 | `30-scaling` | Scale data nodes up and down (shard relocation, exclusions cleared), add and remove a node pool |
 | `31-scale-and-upgrade-together` | A version bump and a data-pool scale-up in the same reconcile window: Upgrader and Scaler serialised, one pod down at a time, both changes applied; then a scale-down concurrent with a config-change restart (fails on N29 while it stands) |
-| `40-chaos` | Pod delete, SIGKILL, cluster-manager loss, disk loss (pod + PVC), two pods at once, operator restart, k8s node outage |
+| `40-chaos` | Pod delete, SIGKILL, cluster-manager loss, disk loss (pod + PVC), two pods at once, operator restart, k8s node outage (runs alone: it restarts the shared operator) |
 | `41-upgrade-under-chaos` | Operator killed and a pod deleted in the middle of a rolling upgrade; upgrade still completes |
 | `50-operator-upgrade` | Cluster made by the previous released operator (`opensearch.opster.io`); upgrading to the local build leaves it untouched, migrates it to `opensearch.org`, and it can still be upgraded (blocked by N25: legacy `dashboards.replicas: 0`) |
 | `51-operator-upgrade-migrated` | Same flow with `dashboards.replicas: 1`, so the migration and the post-migration OpenSearch upgrade are exercised |
