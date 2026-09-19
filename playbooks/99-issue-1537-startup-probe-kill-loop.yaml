@@ -1,0 +1,60 @@
+metadata:
+  description: "Issue #1537 (fixed by 9da64b6 / f320b03): a pod that is alive but repeatedly killed by its startup probe (Running, never ready, restarted in a loop, only briefly CrashLoopBackOff between attempts) matched none of the stuck-pod reasons, so a rolling restart requeued forever with no Warning. A pool-level startup probe that can never pass is applied together with a config change: the first restarted pod (nodes-2) runs OpenSearch fine but is killed every ~40s. The operator must flag it as RepeatedlyFailing (>= 3 restarts before the startup probe ever passed) with the 'rolling restart is stalled' Warning, must not take a second pod down meanwhile, and once the probe is repaired must delete the stuck pod itself ('Deleted stuck pod') and finish the restart one pod at a time with every document kept. Complements 83 (CrashLoopBackOff on a bad setting): here the container never exits on its own."
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 2000, shards: 3, replicas: 1}
+
+  - name: startup_probe_kill_loop_stalls_the_restart
+    description: "Startup probe command that always fails (period 10s, 3 failures): kubelet kills the container after ~40s Running-but-not-ready, restarts it, and the pod only passes through CrashLoopBackOff for the backoff seconds in between. After the third kill the operator must emit the RepeatedlyFailing Warning; the other two nodes keep serving (2 of 3 members, health >= yellow, all documents readable)."
+    steps:
+      - action: patch_cluster
+        params:
+          node_pool:
+            component: nodes
+            additionalConfig: {"http.max_content_length": "150mb"}
+            probes: {startup: {initialDelaySeconds: 10, periodSeconds: 10, failureThreshold: 3, command: ["/bin/sh", "-c", "exit 1"]}}
+      - action: expect_event
+        params: {reason: RollingRestart, type: Warning, contains: "is in RepeatedlyFailing; rolling restart is stalled until the pod becomes ready", timeout: 20m}
+      - action: check_k8s_resource
+        params: {kind: pod, name: __CLUSTER__-nodes-2, expect: {status.containerStatuses.0.started: false}}
+      - action: validate_cluster_health
+        params: {expected_status: yellow, expected_nodes: 2}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+      - action: check_k8s_resource
+        params: {kind: pod, name: __CLUSTER__-nodes-1, expect: {status.containerStatuses.0.ready: true}}
+      - action: check_k8s_resource
+        params: {kind: pod, name: __CLUSTER__-nodes-0, expect: {status.containerStatuses.0.ready: true}}
+
+  - name: repaired_probe_recovers
+    description: "The probe override is removed (config change kept): the stuck pod carries the older revision, so the operator must delete it itself, the pool rolls to the repaired template one pod at a time, and the cluster ends RUNNING/green with every document."
+    steps:
+      - action: patch_cluster
+        params: {remove: ["nodePools.0.probes"]}
+      - action: expect_event
+        params: {reason: RollingRestart, type: Warning, contains: "Deleted stuck pod", timeout: 10m}
+      - action: wait_crashloop_recovery
+        params: {max_unready_pods: 1, min_health: yellow, timeout: 20m}
+      - action: wait_for_cluster_ready
+      - action: check_k8s_resource
+        params: {kind: pod, component: nodes, expect: {status.containerStatuses.0.started: true, status.containerStatuses.0.ready: true}}
+      - action: check_pod_exec
+        params: {all_pods: true, command: "grep http.max_content_length config/opensearch.yml", contains: ["http.max_content_length: 150mb"]}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster
