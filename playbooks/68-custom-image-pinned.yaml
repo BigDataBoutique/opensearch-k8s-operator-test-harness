@@ -51,6 +51,26 @@ phases:
       - action: validate_node_configuration
       - action: validate_operator_status
 
+  - name: invalid_version_transition_with_matching_image_is_still_denied
+    # PR #1555 (issue #1532): the downgrade/major-jump/semver checks used to live only in the
+    # post-admission reconciler and were skipped entirely on this pinned-custom-image path, so an
+    # invalid spec.general.version could sneak in as long as general.image was bumped to match.
+    steps:
+      - action: expect_rejected
+        params:
+          patch: {spec: {general: {version: "5.0.0", image: "docker.io/opensearchproject/opensearch:5.0.0"}}}
+          message: "more than 1 major version"
+      - action: expect_rejected
+        params:
+          patch: {spec: {general: {version: "2.19.6", image: "docker.io/opensearchproject/opensearch:2.19.6"}}}
+          message: "is downgrade"
+      - action: validate_cluster_version
+        params: {expected_version: "${OS_VERSION_3X:-3.8.0}"}
+      - action: check_k8s_resource
+        params: {kind: pod, component: nodes, expect: {spec.containers.0.image: "docker.io/opensearchproject/opensearch:${OS_VERSION_3X:-3.8.0}"}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+
   - name: teardown
     steps:
       - action: delete_cluster

@@ -25,7 +25,10 @@ phases:
           data:
             roles.yml: "_meta:\n  type: roles\n  config_version: 2\nbroken_role:\n  cluster_permissions: not-a-list\n  index_permissions: nope\n"
       - action: expect_event
-        params: {reason: Security, type: Warning, contains: "Securityconfig update job failed, retrying", timeout: 50m}  # the job retries internally until activeDeadlineSeconds (40m) before the operator sees it as Failed
+        params: {reason: Security, type: Warning, contains: "Securityconfig update job failed, retrying", timeout: 12m}  # PR #1560 (#1538) only fixed the operator-side reordering (Failed checked before Active, so this is caught on the first pod attempt instead of waiting for a second); #1538's OWN proposed fix also called for shortening the in-container retry loop
+        # (ApplySingleYmlCmdTmpl: 20 attempts x 20s sleep = up to ~7min per config file) for a permanently-invalid file, which was never done - so
+        # a deterministic failure like this one still takes ~9-10min end-to-end to surface (down from ~13min pre-#1560, but far from "prompt").
+        # 12m gives margin over the observed ~9-10min; see FINDINGS-round8.md. If this starts failing again, the container-side loop may have regressed further.
       # Securityconfig: Failed (with retry:N / lastRetry conditions) lasts only until the retry job is active
       # (30 s initial backoff), after which the status reads Running again; assert the retry job instead.
       - action: check_k8s_resource

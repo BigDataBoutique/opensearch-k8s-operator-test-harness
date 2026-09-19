@@ -1,0 +1,67 @@
+metadata:
+  description: "general.persistentVolumeClaimRetentionPolicy (issue #962 / PR #1437): by default (unset) a scale-down retains the removed ordinal's PVC (current StatefulSet default); setting whenScaled/whenDeleted: Delete on a live cluster is propagated onto the StatefulSet and actually deletes the excess-ordinal PVC on the next scale-down and every PVC on cluster deletion"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 2000, shards: 3, replicas: 1}
+
+  - name: default_policy_retains_on_scale_down
+    steps:
+      - action: scale_cluster
+        params: {component: nodes, replicas: 2, min_health: yellow, max_unready_pods: 1}
+      - action: wait_for_cluster_ready
+      - action: check_k8s_resource
+        params: {kind: pvc, name: data-__CLUSTER__-nodes-2}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+      - action: scale_cluster
+        params: {component: nodes, replicas: 3, min_health: yellow}
+      - action: wait_for_cluster_ready
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+
+  - name: opt_in_delete_policy_wired_to_statefulset
+    steps:
+      - action: patch_cluster
+        params:
+          patch: {spec: {general: {persistentVolumeClaimRetentionPolicy: {whenScaled: Delete, whenDeleted: Delete}}}}
+      - action: check_k8s_resource
+        params:
+          kind: statefulset
+          name: __CLUSTER__-nodes
+          expect: {spec.persistentVolumeClaimRetentionPolicy.whenScaled: Delete, spec.persistentVolumeClaimRetentionPolicy.whenDeleted: Delete}
+
+  - name: scale_down_deletes_excess_pvc
+    steps:
+      - action: scale_cluster
+        params: {component: nodes, replicas: 2, min_health: yellow, max_unready_pods: 1}
+      - action: wait_for_cluster_ready
+      - action: check_k8s_resource
+        params: {kind: pvc, name: data-__CLUSTER__-nodes-2, exists: false}
+      - action: check_k8s_resource
+        params: {kind: pvc, selector: "opensearch.org/opensearch-cluster=__CLUSTER__", min_count: 2}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 2000}
+      - action: scale_cluster
+        params: {component: nodes, replicas: 3, min_health: yellow}
+      - action: wait_for_cluster_ready
+      - action: validate_cluster_health
+      - action: validate_operator_status
+
+  - name: cluster_deletion_removes_all_pvcs
+    steps:
+      - action: delete_cluster_check_pvcs
+        params: {expect_retained: false}
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

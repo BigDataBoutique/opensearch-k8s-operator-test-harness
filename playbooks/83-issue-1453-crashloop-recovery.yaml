@@ -20,7 +20,7 @@ phases:
       - action: patch_cluster
         params: {patch: {spec: {general: {additionalConfig: {"oko.invalid.setting": "true"}}}}}
       - action: expect_event
-        params: {reason: RollingRestart, type: Warning, contains: "CrashLoopBackOff", timeout: 30m}  # OpenSearch takes minutes to die on a bad setting, so the CrashLoopBackOff window the operator polls for appears late
+        params: {reason: RollingRestart, type: Warning, contains: "rolling restart is stalled until the pod becomes ready", timeout: 30m}  # OpenSearch takes minutes to die on a bad setting; PR #1549 broadened detection so the stall reason can be CrashLoopBackOff, ImagePullBackOff or RepeatedlyFailing -- match the stable part of the message instead of one reason word
       - action: check_opensearch_api
         params: {path: /_cluster/health, expect: {number_of_nodes: 2}}
       - action: validate_data_integrity
@@ -31,7 +31,7 @@ phases:
       - action: patch_cluster
         params: {patch: {spec: {general: {additionalConfig: {"oko.invalid.setting": null}}}}}
       - action: expect_event
-        params: {reason: RollingRestart, type: Warning, contains: "Deleted stuck CrashLoopBackOff pod", timeout: 10m}
+        params: {reason: RollingRestart, type: Warning, contains: "Deleted stuck pod", timeout: 10m}  # PR #1549 dropped the reason word from this message too
       - action: wait_crashloop_recovery
         params: {max_unready_pods: 1, min_health: yellow, timeout: 15m}
       - action: wait_for_cluster_ready

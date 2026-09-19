@@ -1,0 +1,54 @@
+metadata:
+  description: "Issue #1521 / PR #1556: a custom security.config.securityConfigSecret whose roles_mapping.yml stops mapping the Dashboards user to a role with cluster-monitor permissions used to fail silently (job succeeds, cluster green, Dashboards crash-loops with no operator signal). The securityconfig reconciler now emits a Warning `DashboardsUserUnmapped` event whenever the custom roles_mapping.yml maps the Dashboards user under neither `users` nor its `backend_roles`, and stays silent once the mapping is restored"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          dashboards: {enabled: true}
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: validate_dashboards
+
+  - name: default_mapping_is_silent
+    steps:
+      - action: expect_event
+        params: {reason: DashboardsUserUnmapped, type: Warning, absent: true, timeout: 3m}
+
+  - name: unmapped_custom_roles_mapping_is_surfaced
+    steps:
+      - action: patch_secret
+        params:
+          name: securityconfig-secret
+          data:
+            roles_mapping.yml: "_meta:\n  type: rolesmapping\n  config_version: 2\nall_access:\n  reserved: false\n  backend_roles:\n  - admin\n  users:\n  - admin\nsecurity_rest_api_access:\n  reserved: false\n  backend_roles:\n  - admin\n  users:\n  - admin\n"
+      - action: check_k8s_resource
+        params: {kind: job, name: __CLUSTER__-securityconfig-update, expect: {status.succeeded: 1}, timeout: 10m}
+      - action: expect_event
+        params: {reason: DashboardsUserUnmapped, type: Warning, contains: "kibanaserver", timeout: 5m}
+      - action: check_opensearch_api
+        params: {path: /_cluster/health, expect: {status: green}}
+      - action: validate_operator_status
+
+  - name: restored_mapping_is_silent_again
+    steps:
+      - action: patch_secret
+        params:
+          name: securityconfig-secret
+          data:
+            roles_mapping.yml: "_meta:\n  type: rolesmapping\n  config_version: 2\nall_access:\n  reserved: false\n  backend_roles:\n  - admin\n  users:\n  - admin\nsecurity_rest_api_access:\n  reserved: false\n  backend_roles:\n  - admin\n  users:\n  - admin\nkibana_server:\n  reserved: true\n  users:\n  - kibanaserver\n"
+      - action: check_k8s_resource
+        params: {kind: job, name: __CLUSTER__-securityconfig-update, expect: {status.succeeded: 1}, timeout: 10m}
+      - action: expect_event
+        params: {reason: DashboardsUserUnmapped, type: Warning, absent: true, timeout: 5m}
+      - action: validate_dashboards
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

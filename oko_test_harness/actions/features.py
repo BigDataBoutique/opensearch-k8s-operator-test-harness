@@ -217,8 +217,11 @@ class ExpectEventAction(BaseAction):
     params = {"reason", "contains", "type", "since", "absent"}
 
     def execute(self, params):
-        since = time.time() - self.timeout(params.get("since", "10m")) if params.get("since") else 0
         if params.get("absent"):  # the event must NOT appear for the whole `timeout` (default 2m)
+            # Default `since` to "now": an event object that already existed before this check started
+            # (e.g. left over from an earlier phase, with lastTimestamp/count just not yet touched again)
+            # must not count as a fresh recurrence, or `absent: true` false-fails on stale state.
+            since = time.time() - self.timeout(params["since"]) if params.get("since") else time.time()
             deadline = time.time() + self.timeout("2m")
             while time.time() < deadline:
                 try:
@@ -227,6 +230,7 @@ class ExpectEventAction(BaseAction):
                 except Exception:  # noqa: BLE001 - not found
                     time.sleep(10)
             return ActionResult(True, f"No event reason={params.get('reason')} containing {params.get('contains')!r} appeared")
+        since = time.time() - self.timeout(params.get("since", "10m")) if params.get("since") else 0
         e = k8s.wait_for("event", lambda: self._find(params, since), self.timeout("5m"), 5)
         return ActionResult(True, f"Event {e.get('type')}/{e.get('reason')}: {(e.get('message') or '')[:200]}")
 

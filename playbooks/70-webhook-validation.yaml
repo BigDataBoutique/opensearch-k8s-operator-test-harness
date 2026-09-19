@@ -1,5 +1,5 @@
 metadata:
-  description: "The OpenSearchCluster validating webhook denies invalid CRs with clear messages (duplicate/empty node pool names, TLS without generate or secret, custom HTTP cert without adminSecret, storage class change, legacy opensearch.opster.io/v1 creation) and leaves the live cluster untouched"
+  description: "The OpenSearchCluster validating webhook denies invalid CRs with clear messages (duplicate/empty node pool names, unknown node pool role, no cluster-manager-eligible pool, TLS without generate or secret, custom HTTP cert without adminSecret, storage class change, legacy opensearch.opster.io/v1 creation) and leaves the live cluster untouched"
 
 phases:
   - name: setup
@@ -27,11 +27,10 @@ phases:
         params:
           cluster_params: {extra_spec: {security: {tls: {transport: {enabled: true, generate: false, perNode: false}}}}}
           message: "transport TLS is enabled but neither generate nor secret is provided"
-      # Same CR without the explicit `enabled: true`: transport TLS is on by default, but the webhook only checks the
-      # explicit case (webhook/opensearch_cluster_webhook.go validateTlsConfig), so this is accepted and the cluster can never start.
-      # Kept as a deliberate failing check (FINDINGS-new.md N7); continue_on_error so the remaining rules still run.
+      # Same CR without the explicit `enabled: true`: transport TLS is on by default, and since #1528 the webhook
+      # uses helpers.IsTransportTlsEnabled (mirroring the #1546 HTTP TLS fix) so the unset case is caught too
+      # (old N7 gap; the finding described here no longer applies).
       - action: expect_rejected
-        continue_on_error: true
         params:
           cluster_params: {extra_spec: {security: {tls: {transport: {generate: false, perNode: false}}}}}
           message: "transport TLS is enabled but neither generate nor secret is provided"
@@ -49,6 +48,16 @@ phases:
         params:
           cluster_params: {extra_spec: {security: {tls: {http: {generate: false, secret: {name: some-http-cert}}}}}}
           message: "admin secret name is not provided but http.tls generate is not true"
+      # PR #1557: the StatefulSet builder silently drops any role not on helpers.ValidNodeRoles, so an unknown
+      # role used to produce a cluster missing that role rather than a rejection.
+      - action: expect_rejected
+        params:
+          cluster_params: {node_pools: [{component: nodes, replicas: 3, roles: ["bogus_role"]}]}
+          message: "has unknown role 'bogus_role'"
+      - action: expect_rejected
+        params:
+          cluster_params: {node_pools: [{component: nodes, replicas: 3, roles: ["data"]}]}
+          message: "at least one node pool must have the cluster_manager role"
 
   - name: cluster_update_rules
     steps:

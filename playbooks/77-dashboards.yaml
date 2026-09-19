@@ -18,6 +18,14 @@ phases:
       - action: wait_for_cluster_ready
       - action: validate_dashboards
         params: {replicas: 2}
+      # Issue #1522 (fixed): a shared annotations map leaked opensearch.org/last-applied into the pod template,
+      # and an unset rollingUpdate caused a perpetual no-op diff, together forcing a second rollout right after
+      # creation. revision=1 means the Deployment never rolled a second time.
+      - action: check_k8s_resource
+        params:
+          kind: deployment
+          name: __CLUSTER__-dashboards
+          expect: {metadata: {annotations: {"deployment.kubernetes.io/revision": "1"}}}
 
   - name: verify
     steps:

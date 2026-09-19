@@ -1,5 +1,5 @@
 metadata:
-  description: "A version change that skips a major (2.x -> 4.0.0) or downgrades is refused by the reconciler with a Warning/Upgrade event, the cluster and status.version stay untouched, the operator keeps reconciling, and a valid upgrade still works after reverting the spec"
+  description: "A version change that skips a major (2.x -> 4.0.0) or downgrades is denied at admission (PR #1555 moved the check from the post-hoc reconciler Warning event into the validating webhook's ValidateUpdate, so the bad value is never written to the spec at all); the cluster and status.version stay untouched, the operator keeps reconciling, and a valid upgrade still works afterwards"
 
 phases:
   - name: setup
@@ -17,31 +17,19 @@ phases:
 
   - name: major_jump_refused
     steps:
-      - action: patch_cluster
-        params: {patch: {spec: {general: {version: "4.0.0"}}}}
-      - action: expect_event
-        params: {reason: Upgrade, type: Warning, contains: "more than 1 major version"}
+      - action: expect_rejected
+        params: {patch: {spec: {general: {version: "4.0.0"}}}, message: "more than 1 major version"}
       - action: validate_cluster_version
         params: {expected_version: "${OS_VERSION_2X:-2.19.6}"}
       - action: check_k8s_resource
         params: {kind: pod, component: nodes, expect: {spec.containers.0.image: "docker.io/opensearchproject/opensearch:${OS_VERSION_2X:-2.19.6}"}}
-      - action: patch_cluster
-        params: {patch: {spec: {general: {version: "${OS_VERSION_2X:-2.19.6}"}}}, wait_running: true}
-      - action: wait_for_cluster_ready
-        params: {expect_version: "${OS_VERSION_2X:-2.19.6}"}
 
   - name: downgrade_refused
     steps:
-      - action: patch_cluster
-        params: {patch: {spec: {general: {version: "2.18.0"}}}}
-      - action: expect_event
-        params: {reason: Upgrade, type: Warning, contains: "is a downgrade"}
+      - action: expect_rejected
+        params: {patch: {spec: {general: {version: "2.18.0"}}}, message: "is downgrade"}
       - action: validate_cluster_version
         params: {expected_version: "${OS_VERSION_2X:-2.19.6}"}
-      - action: patch_cluster
-        params: {patch: {spec: {general: {version: "${OS_VERSION_2X:-2.19.6}"}}}, wait_running: true}
-      - action: wait_for_cluster_ready
-        params: {expect_version: "${OS_VERSION_2X:-2.19.6}"}
       - action: validate_data_integrity
         params: {index: data-a, expected_documents: 2000}
 

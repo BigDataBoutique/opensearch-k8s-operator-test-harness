@@ -1,0 +1,37 @@
+metadata:
+  description: "Issue #1530 / PR #1536: smartScaler defaults to true even when spec.confMgmt is omitted entirely (not just when confMgmt is present without smartScaler). With no confMgmt block at all, a scale-down under live indexing must still exclude + drain the departing data node before removing it: health stays >= yellow, no documents lost. Before the fix, an omitted confMgmt block skipped the default and the node was removed undrained (silent data loss, only a Normal event)."
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          # No confMgmt block at all - this is the specific gap PR #1536 fixed (every other scaling
+          # playbook sets confMgmt.smartScaler explicitly, which never exercised the omitted-block default).
+          node_pools:
+            - {component: masters, replicas: 3, roles: ["cluster_manager"]}
+            - {component: data, replicas: 3, roles: ["data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 4000, shards: 3, replicas: 1}
+
+  - name: scale_down_without_confmgmt
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 5m, min_success_ratio: 0.95}
+      - action: scale_cluster
+        params: {component: data, replicas: 2, min_health: yellow, max_unready_pods: 1}
+      - action: wait_for_cluster_ready
+      - action: validate_cluster_configuration
+        params: {total_nodes: 5, roles: {cluster_manager: 3, data: 2}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 4000}
+      - action: validate_node_configuration
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster

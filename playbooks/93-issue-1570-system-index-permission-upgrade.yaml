@@ -1,0 +1,45 @@
+metadata:
+  description: "Issue #1570 (open; fixed by PR #1569, narrower fix in #1579): with plugins.security.system_indices.permission.enabled=true and the operator on basic auth, the first upgraded node leaves allocation at 'primaries', .opendistro_security goes yellow, the pre-restart health gate's _cat/shards/.opendistro_security gets 403, allocation is never re-enabled and the upgrade stalls after one pod. Expected to fail (upgrade timeout) while unfixed"
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X_OLD:-3.0.0}"
+          cluster_settings:
+            "plugins.security.system_indices.permission.enabled": "true"
+          node_pools:
+            - {component: nodes, replicas: 3, roles: ["cluster_manager", "data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: check_pod_exec
+        params: {component: nodes, all_pods: true, command: "grep '^plugins.security.system_indices.permission.enabled' config/opensearch.yml", contains: ["plugins.security.system_indices.permission.enabled: true"]}
+      # precondition for the bug: the admin basic-auth user (the same one the operator uses) is denied the explicit system-index cat call
+      - action: check_opensearch_api
+        params: {path: "/_cat/shards/.opendistro_security?format=json", status: 403}
+      - action: index_documents
+        params: {index: data-a, count: 3000, shards: 3, replicas: 1}
+
+  - name: upgrade
+    steps:
+      - action: upgrade_cluster
+        params: {target_version: "${OS_VERSION_3X:-3.8.0}", max_unready_pods: 1}
+
+  - name: verify
+    steps:
+      - action: wait_for_cluster_ready
+        params: {expect_version: "${OS_VERSION_3X:-3.8.0}"}
+      - action: validate_cluster_version
+        params: {expected_version: "${OS_VERSION_3X:-3.8.0}"}
+      # allocation must be back to 'all' (or unset) once the upgrade is done
+      - action: check_opensearch_api
+        params: {path: "/_cluster/settings?flat_settings=true", absent: ["\"cluster.routing.allocation.enable\":\"primaries\""]}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 3000}
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster
