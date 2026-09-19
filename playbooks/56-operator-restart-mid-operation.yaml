@@ -1,0 +1,104 @@
+metadata:
+  description: "The operator is taken down (Deployment scaled to 0) in the middle of two long-running operations and must resume each from the state persisted on the CR instead of starting over or giving up: (1) a smartScaler scale-down whose node is excluded and draining, where the drain finishes in OpenSearch while the operator is away and the returned operator must carry the Scaler entry through Drained to the node's removal, then clear exclude._name; (2) a config-change rolling restart with a data pod deleted, where the StatefulSet brings the pod back by itself and the returned operator must continue restarting the remaining pods one at a time (RollingRestart Finished, allocation.enable back to all). Operator restarts and upgrades happen during operations in production; 41 covers a kill mid-upgrade, 76 a deletion while down. Uses scale_operator, so it owns the operator for its duration (run alone)."
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          extra_spec: {confMgmt: {smartScaler: true}}
+          node_pools:
+            - {component: masters, replicas: 3, roles: ["cluster_manager"]}
+            - {component: data, replicas: 3, roles: ["data", "ingest"]}
+      - action: wait_for_cluster_ready
+      # Throttle shard recovery so the drain of the departing node takes a minute or two instead of seconds: the
+      # operator has to be taken down while the node is still excluded and draining (drainPollInterval is 15s).
+      - action: update_cluster_settings
+        params: {settings: {"indices.recovery.max_bytes_per_sec": "512kb"}}
+      - action: index_documents
+        params: {index: data-a, count: 40000, shards: 6, replicas: 1}
+
+  - name: operator_down_mid_drain
+    description: "Scale data 3 -> 2 in the background; as soon as the Scaler reports the node excluded the operator is scaled to 0 (recovery is throttled so the drain outlasts that moment). The drain completes without it (no shard left on data-2), the operator comes back, finds Scaler: Excluded/Drained on the CR and removes the node: 5 members, green, no document loss, exclude._name cleared, Scaler status gone."
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 10m, min_success_ratio: 0.9}
+      - action: scale_cluster
+        background: true
+        params: {component: data, replicas: 2, min_health: yellow, max_unready_pods: 1, timeout: 30m}
+      - action: expect_event
+        params: {reason: Scaler, type: Normal, contains: "Finished to Exclude", timeout: 5m}
+      - action: scale_operator
+        params: {replicas: 0}
+      - action: check_opensearch_api
+        params: {path: "/_cat/shards?format=json&h=node", absent: ["data-2"], timeout: 10m}
+      - action: check_k8s_resource
+        params: {kind: pod, name: __CLUSTER__-data-2, expect: {status.phase: Running}}
+      - action: check_k8s_resource
+        params:
+          kind: opensearchclusters.opensearch.org
+          name: __CLUSTER__
+          expect: {status.componentsStatus: [{component: Scaler, description: data}]}
+      - action: scale_operator
+        params: {replicas: 1}
+
+  - name: verify_after_drain
+    steps:
+      - action: wait_for_cluster_ready
+      - action: update_cluster_settings
+        params: {settings: {"indices.recovery.max_bytes_per_sec": null}}
+      - action: validate_cluster_configuration
+        params: {total_nodes: 5, roles: {cluster_manager: 3, data: 2}}
+      - action: check_k8s_resource
+        params: {kind: pod, name: __CLUSTER__-data-2, exists: false}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 40000}
+      - action: validate_operator_status
+
+  - name: operator_down_mid_rolling_restart
+    description: "Config-change rolling restart in the background (data pods first, highest ordinal first); the moment data-2 is down the operator is scaled to 0. The StatefulSet recreates data-2 on its own; only once it is ready again does the operator return. It must pick the restart up from RollingRestart: InProgress and replace data-1, data-0 and the managers one at a time, never two down, no document loss, then report Finished with allocation restored."
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live2, count: 200, replicas: 1, duration: 15m, min_success_ratio: 0.9}
+      - action: rolling_restart
+        background: true
+        params: {patch: {spec: {general: {additionalConfig: {"http.max_content_length": "150mb"}}}}, max_unready_pods: 1, min_health: yellow, timeout: 30m}
+      - action: wait_for_pod_state
+        params: {name: __CLUSTER__-data-2, state: not_ready, timeout: 10m}
+      - action: scale_operator
+        params: {replicas: 0}
+      - action: check_k8s_resource
+        params:
+          kind: opensearchclusters.opensearch.org
+          name: __CLUSTER__
+          expect: {status.componentsStatus: [{component: RollingRestart, status: InProgress}]}
+      - action: wait_for_pod_state
+        params: {name: __CLUSTER__-data-2, state: ready, timeout: 10m}
+      - action: scale_operator
+        params: {replicas: 1}
+
+  - name: verify_after_restart
+    steps:
+      - action: wait_for_cluster_ready
+      - action: check_k8s_resource
+        params:
+          kind: opensearchclusters.opensearch.org
+          name: __CLUSTER__
+          expect: {status.componentsStatus: [{component: RollingRestart, status: Finished}]}
+      - action: check_pod_exec
+        params: {all_pods: true, command: "grep http.max_content_length config/opensearch.yml", contains: ["http.max_content_length: 150mb"]}
+      - action: validate_cluster_configuration
+        params: {total_nodes: 5, roles: {cluster_manager: 3, data: 2}}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 40000}
+      - action: validate_node_configuration
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster
