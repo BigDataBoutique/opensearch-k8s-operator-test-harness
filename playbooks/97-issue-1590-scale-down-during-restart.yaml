@@ -1,0 +1,73 @@
+metadata:
+  description: "Issue #1590 (open; the reverse direction of #1572): a config-change rolling restart is in flight on a 3-manager + 3-data cluster under live indexing and, while a data pod is down, the data pool's replicas are lowered 3 -> 2. The Scaler must wait until the pool is whole again before excluding, draining and removing a node: never two data members absent at once, health >= yellow, no document loss, final topology 3 + 2 with every pod restarted, allocation settings restored, RUNNING. EXPECTED TO FAIL until upstream #1590 is merged: the Scaler has no readiness gate (only a version-mismatch check), runs before the restart reconciler in the chain, and shrinks the StatefulSet while the restarted pod is still absent (6 -> 4 members)."
+
+phases:
+  - name: setup
+    steps:
+      - action: setup_cluster
+      - action: install_operator
+      - action: deploy_cluster
+        params:
+          version: "${OS_VERSION_3X:-3.8.0}"
+          extra_spec: {confMgmt: {smartScaler: true}}
+          node_pools:
+            - {component: masters, replicas: 3, roles: ["cluster_manager"]}
+            - {component: data, replicas: 3, roles: ["data", "ingest"]}
+      - action: wait_for_cluster_ready
+      - action: index_documents
+        params: {index: data-a, count: 4000, shards: 3, replicas: 1}
+      # Keep the last data node (the one a scale-down removes) empty of user shards so its drain is instant: the race
+      # is then decided by the Scaler's gate alone, not by how long the drain of a loaded node happens to take
+      # (#1590 reproduces with a near-empty node within one or two 15s poll cycles).
+      - action: check_opensearch_api
+        params:
+          method: PUT
+          path: /data-a/_settings
+          body: {index: {routing: {allocation: {exclude: {_name: "__CLUSTER__-data-2"}}}}}
+      - action: check_opensearch_api
+        params:
+          method: PUT
+          path: /_index_template/oko-live-off-last-node
+          body: {index_patterns: ["data-live*"], priority: 500, template: {settings: {index: {routing: {allocation: {exclude: {_name: "__CLUSTER__-data-2"}}}}}}}
+      - action: check_opensearch_api
+        params: {path: "/_cat/shards/data-a?format=json&h=node", absent: ["data-2"]}
+
+  - name: scale_down_while_a_restarted_pod_is_down
+    description: "The restart takes data pods first, highest ordinal first: data-2, then data-1. The replicas patch lands the moment data-1 is absent. Asserted: no sample ever shows two of the three data members absent (data-2 must not be removed before data-1 is back), the scale-down and the restart both finish with at most one pod down at a time, and nothing is lost. EXPECTED TO FAIL on #1590: data-2 is excluded, drained and removed while data-1 is still absent."
+    steps:
+      - action: index_documents
+        background: true
+        params: {index: data-live, count: 200, replicas: 1, duration: 15m, min_success_ratio: 0.9}
+      - action: rolling_restart
+        background: true
+        params: {patch: {spec: {general: {additionalConfig: {"http.max_content_length": "150mb"}}}}, max_unready_pods: 1, min_health: yellow, timeout: 30m}
+      - action: wait_for_pod_state
+        params: {name: __CLUSTER__-data-1, state: not_ready, timeout: 15m}
+      - action: scale_cluster
+        background: true
+        params: {component: data, replicas: 2, min_health: yellow, max_unready_pods: 1, timeout: 30m}
+      - action: wait_for_pod_state
+        params: {component: data, ordinals: 3, state: not_ready, count: 2, never: true, timeout: 6m}
+
+  - name: verify
+    steps:
+      - action: wait_for_cluster_ready
+      - action: validate_cluster_configuration
+        params: {total_nodes: 5, roles: {cluster_manager: 3, data: 2}}
+      - action: check_k8s_resource
+        params:
+          kind: opensearchclusters.opensearch.org
+          name: __CLUSTER__
+          expect: {status.componentsStatus: [{component: RollingRestart, status: Finished}]}
+      - action: check_pod_exec
+        params: {all_pods: true, command: "grep http.max_content_length config/opensearch.yml", contains: ["http.max_content_length: 150mb"]}
+      - action: validate_data_integrity
+        params: {index: data-a, expected_documents: 4000}
+      - action: query_documents
+        params: {index: data-live, expected_min_count: 3000}
+      - action: validate_node_configuration
+      - action: validate_operator_status
+
+  - name: teardown
+    steps:
+      - action: delete_cluster
