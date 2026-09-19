@@ -1,9 +1,8 @@
 metadata:
   description: "Cluster created by the previous released operator (opensearch.opster.io); upgrading the operator to the local build must leave the cluster untouched, migrate it to opensearch.org, and still upgrade OpenSearch afterwards"
 
-# BLOCKED on the current operator build at migrated_api_group.set_api_group: the legacy CR stores dashboards.replicas: 0
-# (the 2.x CRD requires the field) and the 3.x migration controller's update is denied by the legacy webhook (FINDINGS-round3 N25).
-# 51-operator-upgrade-migrated runs the same flow with replicas: 1 to exercise the migration and post-migration steps.
+# The operator upgrade rolls every pod once as the 3.x reconciler adopts the cluster (new StatefulSet selector and pod
+# template, upstream #1580); the migrated_api_group phase then exercises the #1540 fix for a legacy CR with dashboards.replicas: 0.
 
 config:
   opensearch:
@@ -30,7 +29,7 @@ phases:
   - name: upgrade_operator
     steps:
       - action: upgrade_operator
-        params: {version: local}
+        params: {version: local, expect_restart: true, timeout: 20m}  # one-time rolling restart on adoption (#1580)
       - action: validate_operator_status
       - action: validate_data_integrity
         params: {index: data-a, expected_documents: 3000}
