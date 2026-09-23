@@ -136,6 +136,32 @@ def cleanup(all_clusters):
             click.echo(f"Ran: {' '.join(tool)}")
 
 
+@cli.command("free-crs")
+@click.argument("namespace")
+def free_crs(namespace):
+    """Delete only the OpenSearchCluster CR(s) in NAMESPACE (both API groups) -- unlike `cleanup`, the
+    namespace, its pods, PVCs and events are left untouched for inspection. Used by the runner between
+    solo/migration playbooks: a failed playbook's leftover cluster otherwise blocks every later solo
+    playbook's 'operator CRs exist' guard (they run strictly sequentially with no cleanup between them),
+    and the failure's diagnostics are already captured to logs/<pb>-<ts>/ by the time this runs."""
+    entries = k8s.operator_crs(namespace)
+    if not entries:
+        click.echo(f"No operator CRs in {namespace}")
+        return
+    for entry in entries:
+        kind, ref = entry.split(" ", 1)
+        name = ref.split("/", 1)[1]
+        k8s.kubectl("delete", kind, name, "-n", namespace, "--ignore-not-found", "--wait=false", check=False)
+    deadline = time.time() + 60
+    while time.time() < deadline and k8s.operator_crs(namespace):
+        time.sleep(5)
+    remaining = k8s.operator_crs(namespace)
+    if remaining:
+        freed = k8s.strip_operator_finalizers(namespace)
+        click.echo(f"{namespace} CRs still present after 60s (finalizer stuck, see FINDINGS-round5 N34); stripped {freed}")
+    click.echo(f"Freed CRs in {namespace}: {entries}")
+
+
 def _print_results(ctx) -> None:
     click.echo(f"\n{ctx.playbook.metadata.name}: {ctx.status.value} in {int((ctx.end_time or time.time()) - ctx.start_time)}s")
     for step_id, result in ctx.results.items():

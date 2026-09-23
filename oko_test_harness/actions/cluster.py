@@ -54,7 +54,7 @@ class SetupClusterAction(BaseAction):
             return ActionResult(True, f"Using existing cluster (context {k8s.current_context()})")
         if provider == "k3d":
             if any(c["name"] == k.cluster_name for c in json.loads(sh(["k3d", "cluster", "list", "-o", "json"]))):
-                sh(["kubectl", "config", "use-context", f"k3d-{k.cluster_name}"])
+                k8s.switch_context(f"k3d-{k.cluster_name}")
                 return ActionResult(True, f"k3d cluster {k.cluster_name} already exists")
             cmd = ["k3d", "cluster", "create", k.cluster_name, "--agents", str(nodes), "--wait", "--timeout", "5m"]
             # k3d nodes share the host disk: on a busy laptop the kubelet defaults (image GC at 85%, eviction at 5% free)
@@ -68,7 +68,7 @@ class SetupClusterAction(BaseAction):
             sh(cmd)
         elif provider == "kind":
             if k.cluster_name in sh(["kind", "get", "clusters"]).split():
-                sh(["kubectl", "config", "use-context", f"kind-{k.cluster_name}"])
+                k8s.switch_context(f"kind-{k.cluster_name}")
                 return ActionResult(True, f"kind cluster {k.cluster_name} already exists")
             image = f"kindest/node:{version}" if version else None
             cfg = "kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n"
@@ -156,8 +156,12 @@ class InstallOperatorAction(BaseAction):
                 sh(cmd, timeout=900)
                 break
             except RuntimeError as e:
-                if "another operation" in str(e) and attempt < 5:
-                    logger.info("helm release busy, retrying in 20s")
+                # "another operation" = helm's own release lock; "already exists" = two concurrent first-ever
+                # installs of this release both took the no-prior-release branch (helm's create isn't atomic) --
+                # both are the same underlying single-shared-operator race, just at different points in helm's
+                # lifecycle, and both resolve the same way: back off and let `helm upgrade --install` retry.
+                if ("another operation" in str(e) or "already exists" in str(e)) and attempt < 5:
+                    logger.info("helm release busy (concurrent install/upgrade), retrying in 20s")
                     time.sleep(20)
                     continue
                 raise

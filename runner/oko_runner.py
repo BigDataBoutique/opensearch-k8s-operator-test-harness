@@ -5,8 +5,8 @@ to read playbook steps when importable, with a regex fallback).
 Discovers playbooks dynamically (no hand-maintained lane lists to rebalance every time one is
 added or removed — a recurring source of drift in scripts/run-suite.sh). Three phases:
 
-  1. build-first : the `10-*` playbook alone, if present, so only one `make docker-build` /
-                    `k3d image import` race happens (RUNNING.md section 4).
+  1. build-first : whichever pool-eligible playbook sorts first, alone, so only one `make docker-build` /
+                    `k3d image import` race happens (RUNNING.md section 4). No naming convention required.
   2. pool        : everything else except the migration playbooks, up to CONCURRENCY at a time
                     (default 2 — see RUNNING.md section 1 for why that ceiling exists).
   3. solo        : one at a time. First every playbook whose steps touch the shared operator
@@ -14,12 +14,16 @@ added or removed — a recurring source of drift in scripts/run-suite.sh). Three
                     `install_operator` that is not the plain idempotent `version: local` install --
                     derived from the playbook's steps, so a new playbook cannot regress it; a
                     playbook can also opt in with `metadata.run_alone: true`), then the migration/
-                    operator-upgrade playbooks (`50-55`, `62`) in the tested-safe order from
-                    RUNNING.md section 4b. An operator restart under a parallel lane restarts the
-                    reconcile of every other lane's cluster and loses its operator log (2026-09-18:
-                    playbook 76's scale_operator restarted the operator under playbook 31's rolling
-                    restart), and the migration playbooks replace the operator outright and refuse
-                    to start while any OpenSearchCluster exists.
+                    operator-upgrade playbooks (any playbook that calls `upgrade_operator` -- again
+                    read from its steps, not its number) in the tested-safe order from RUNNING.md
+                    section 4b (SOLO_ORDER — the one place a playbook *number* is used on purpose,
+                    since that sequence encodes operator quirks no single playbook's YAML expresses;
+                    a migration playbook not yet added there still runs, just last/unordered). An
+                    operator restart under a parallel lane restarts the reconcile of every other
+                    lane's cluster and loses its operator log (2026-09-18: playbook 76's
+                    scale_operator restarted the operator under playbook 31's rolling restart), and
+                    the migration playbooks replace the operator outright and refuse to start while
+                    any OpenSearchCluster exists.
 
 A background supervisor thread watches every running/finished playbook and only calls out to
 Claude Code (`claude -p`, read-only tools) in three situations:
@@ -63,22 +67,35 @@ Env vars (all optional):
                         (default off — leaves it for human inspection, matching the harness's own
                         cleanup_on_failure: false default; turn this on for long unattended runs
                         where namespace pile-up/IO pressure is the bigger risk, see RUNNING.md 4)
+  DISK_HIGH_PCT         host disk % used at which the runner auto-pauses starting new playbooks and
+                        runs `docker builder prune -f` (default 85 — RUNNING.md's documented image-GC/
+                        IO-pressure threshold). Playbooks already running are never touched.
+  DISK_LOW_PCT          disk % used to drop back below before resuming new starts (default 80)
+  DISK_CHECK_SECS       how often the disk watchdog polls (default 120)
   PLAYBOOKS             comma-separated filter (playbook name or numeric prefix)
   DRY_RUN=1             print the plan, run nothing
 
 Last-known-safe design notes (see RUNNING.md for the underlying incidents):
   - Never call `oko-test cleanup` while the pool phase has active playbooks — it deletes every
     oko-test=true namespace, including live clusters mid-run. Only called at phase boundaries
-    (start, and once between pool and solo) where nothing else is running.
+    (start, and once between pool and solo) where nothing else is running. Between individual solo/
+    migration playbooks (which have no such boundary between them), a failed playbook instead gets
+    just its OpenSearchCluster CR(s) freed via `oko-test free-crs <namespace>` — enough to unblock the
+    next solo playbook's "operator CRs exist" guard without discarding the failed namespace's pods/
+    PVCs/events, which `oko-test cleanup` would.
   - A step that stops logging is not necessarily hung (an operation can legitimately run 15-20
     min) — STUCK_SECS should stay comfortably below the harness's own 40m per-step backstop, and
     the diagnostic call is read-only and advisory: it never kills or restarts anything on its own.
+  - disk_watchdog() only ever pauses new starts and prunes the (safe, disposable) docker build cache;
+    it never deletes a namespace or kills a running playbook — a genuine operator bug under real disk
+    pressure should still reproduce on a deliberate rerun, not get silently swept up as "environment".
 """
 import collections
 import glob
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -102,16 +119,24 @@ DIAG_COOLDOWN = int(os.environ.get("DIAG_COOLDOWN", 900))
 VALIDATE_MIN_STEPS = int(os.environ.get("VALIDATE_MIN_STEPS", 8))
 MODEL = os.environ.get("MODEL", "claude-sonnet-5")
 AUTO_CLEANUP_FAILED = os.environ.get("AUTO_CLEANUP_FAILED") == "1"
+DISK_HIGH_PCT = float(os.environ.get("DISK_HIGH_PCT", 85))   # RUNNING.md's documented image-GC/IO-pressure threshold
+DISK_LOW_PCT = float(os.environ.get("DISK_LOW_PCT", 80))     # resume point; kept below DISK_HIGH_PCT to avoid flapping
+DISK_CHECK_SECS = int(os.environ.get("DISK_CHECK_SECS", 120))
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
 ONLY = [p.strip() for p in os.environ.get("PLAYBOOKS", "").split(",") if p.strip()]
 POLL_SECS = 2  # how often the log-tail thread re-reads a running playbook's debug log
 SUPERVISE_SECS = 30  # how often the supervisor scans for stuck/finished playbooks
 
-# Migration / operator-upgrade playbooks: they replace the shared operator and refuse to run
-# while any OpenSearchCluster exists (RUNNING.md section 4b) -- must never overlap with anything.
-MIGRATION_PATTERNS = [re.compile(r"^5[0-5]-"), re.compile(r"^62-")]
+# Nothing here is keyed by playbook *number* -- classification (solo vs. pool, migration vs. not, which
+# playbook builds the image first) is read from each playbook's own steps via operator_steps() below, so a
+# new playbook needs no entry added anywhere just to be scheduled correctly (the discover-dynamically
+# design this runner already uses for the pool/solo split itself -- see module docstring -- extended to
+# migration/build-first, which used to be filename-number regexes and silently misclassified anything not
+# named to match them). The one place a number is still used on purpose is SOLO_ORDER: the tested-safe
+# *sequence* between migration playbooks encodes real operator quirks (e.g. a legacyAPI-toggle ordering
+# constraint) that no single playbook's own YAML can express -- that's sequencing, not classification, and
+# a migration playbook not yet listed there still runs (just last, unordered) rather than being dropped.
 SOLO_ORDER = ["51", "50", "52", "54", "55", "62", "53"]  # tested-safe order; 53 last (toggles legacyAPI)
-BUILD_FIRST_PREFIX = "10-"  # if present, run alone first (builds/imports the operator image)
 # Actions that restart, replace or reconfigure the shared operator Deployment. A playbook containing any of
 # them runs solo: under a parallel lane the restart interrupts every other lane's reconcile and loses the
 # operator log of the window they are asserting on. `install_operator` is special-cased in operator_steps().
@@ -227,7 +252,9 @@ if "--tui" in sys.argv:
 
 lock = threading.Lock()
 combined = collections.deque(maxlen=5000)
-paused = threading.Event()
+paused = threading.Event()        # manual pause, toggled from the TUI
+disk_paused = threading.Event()   # automatic pause from disk_watchdog(); kept separate so it can't be
+                                   # silently cleared by a human toggling `paused`, or vice versa
 
 
 def fmt_delta(secs):
@@ -279,7 +306,7 @@ class Playbook:
         self.last_diagnosed = 0
         self.finalized = False
         self.namespace = None
-        self.migration = any(pat.match(self.name) for pat in MIGRATION_PATTERNS)
+        self.migration = False  # set by classify(), from this playbook's own steps -- not its filename
         self.solo_reasons = []  # why classify() put it in the solo group (empty = parallel pool)
 
     @property
@@ -353,16 +380,24 @@ def discover_playbooks():
 
 
 def classify(pbs):
-    """(build_first, pool, solo). A playbook is solo when it is a migration playbook (name pattern), when its steps
-    touch the shared operator (operator_steps()), or when it sets metadata.run_alone. Non-migration solo playbooks
-    come first (by name), then the migration ones in SOLO_ORDER, so a failed migration playbook's leftover chart
-    never bleeds into the others."""
-    build_first = [p for p in pbs if p.name.startswith(BUILD_FIRST_PREFIX)]
-    rest = [p for p in pbs if p not in build_first]
-    for p in rest:
-        p.solo_reasons = (["migration"] if p.migration else []) + operator_steps(p.path)
-    solo = [p for p in rest if p.solo_reasons]
-    pool = [p for p in rest if p not in solo]
+    """(build_first, pool, solo). A playbook is solo when its own steps touch the shared operator
+    (operator_steps(): scale/kill/upgrade_operator, a non-idempotent install_operator, or metadata.run_alone)
+    -- a migration playbook is just the special case that calls upgrade_operator, detected the same way, not
+    by filename. Non-migration solo playbooks come first (by name), then the migration ones in SOLO_ORDER, so
+    a failed migration playbook's leftover chart never bleeds into the others. Whichever pool playbook sorts
+    first runs alone first (build_first): no naming convention needed, just one playbook to absorb the
+    initial operator image build/import before the rest start concurrently (RUNNING.md section 4)."""
+    for p in pbs:
+        p.solo_reasons = operator_steps(p.path)
+        p.migration = "upgrade_operator" in p.solo_reasons
+        if p.migration:
+            p.solo_reasons = ["migration"] + p.solo_reasons
+    solo = [p for p in pbs if p.solo_reasons]
+    pool = [p for p in pbs if p not in solo]
+    # sorted by name regardless of the order `pbs` was given in, so "whichever sorts first" is a real,
+    # caller-order-independent invariant (discover_playbooks() already sorts, but classify() shouldn't rely on it)
+    build_first = sorted(pool, key=lambda p: p.name)[:1]
+    pool = [p for p in pool if p not in build_first]
 
     def solo_key(p):
         prefix = p.name.split("-")[0]
@@ -388,7 +423,7 @@ def run_pool(items, concurrency):
     active = []
     while idx < len(items) or active:
         active = [p for p in active if p.running]
-        while not paused.is_set() and len(active) < concurrency and idx < len(items):
+        while not (paused.is_set() or disk_paused.is_set()) and len(active) < concurrency and idx < len(items):
             pb = items[idx]
             idx += 1
             pb.start()
@@ -398,11 +433,18 @@ def run_pool(items, concurrency):
 
 def run_solo(items):
     for pb in items:
-        while paused.is_set():
+        while paused.is_set() or disk_paused.is_set():
             time.sleep(3)
         pb.start()
         while pb.running:
             time.sleep(3)
+        if pb.status == "failed" and pb.namespace:
+            # solo/migration playbooks run strictly sequentially with no cleanup between them (only before
+            # the phase starts) -- a leftover OpenSearchCluster from this failure would otherwise trip every
+            # later solo playbook's "operator CRs exist" guard (2026-09-23: one migration failure cascaded
+            # into 4 more). Only the CR(s) are removed; the namespace/pods/events stay for inspection.
+            log_event(f"[{pb.name}] freeing its OpenSearchCluster CR(s) in {pb.namespace} so later solo playbooks aren't blocked by it")
+            run_capture(["poetry", "run", "oko-test", "free-crs", pb.namespace], timeout=90)
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +578,31 @@ def supervisor(all_pbs, stop_event):
         time.sleep(SUPERVISE_SECS)
 
 
+def disk_pct(path="/"):
+    st = shutil.disk_usage(path)
+    return st.used / st.total * 100
+
+
+def disk_watchdog(stop_event):
+    """Auto-pause starting new playbooks under disk pressure instead of letting it cascade into the
+    non-operator failures RUNNING.md documents (image GC, containerd IO stalls, cert-manager/operator
+    webhooks going unreachable) -- observed 2026-09-23: ~12 pool playbooks failed on bare kubectl/webhook
+    timeouts in the back half of an 8h run with disk sitting at 85%. Playbooks already running are left
+    alone (killing mid-run loses the very evidence a real operator bug would need); only new starts pause."""
+    while not stop_event.is_set():
+        pct = disk_pct()
+        if pct >= DISK_HIGH_PCT and not disk_paused.is_set():
+            disk_paused.set()
+            log_event(f"disk at {pct:.0f}% (>= {DISK_HIGH_PCT:.0f}%): pausing new playbook starts, pruning docker build cache")
+            run_capture(["docker", "builder", "prune", "-f"], timeout=180)
+            pct = disk_pct()
+            log_event(f"disk at {pct:.0f}% after prune", trace=False)
+        elif disk_paused.is_set() and pct < DISK_LOW_PCT:
+            disk_paused.clear()
+            log_event(f"disk back down to {pct:.0f}% (< {DISK_LOW_PCT:.0f}%): resuming new playbook starts")
+        stop_event.wait(DISK_CHECK_SECS)
+
+
 def wait_for_diagnoses(timeout_each=200):
     """Block until every in-flight diagnose()/finalize() thread has finished (each `diagnose()` call
     already times out on its own at 180s, so this can't hang indefinitely). Called after the last
@@ -560,6 +627,7 @@ def orchestrate(build_first, pool, solo, stop_event):
     all_pbs = build_first + pool + solo
     start_trace(build_first, pool, solo)
     threading.Thread(target=supervisor, args=(all_pbs, stop_event), daemon=True).start()
+    threading.Thread(target=disk_watchdog, args=(stop_event,), daemon=True).start()
 
     log_event("cleanup: clearing any leftover namespaces before starting")
     run_capture(["poetry", "run", "oko-test", "cleanup"], timeout=120)
@@ -615,25 +683,37 @@ def start_trace(build_first, pool, solo):
 """)
 
 
-def print_summary(all_pbs):
+def print_summary(all_pbs, interrupted=False):
+    """The one place a run's outcome gets written down. Always called before the process actually exits
+    (normal completion, TUI quit, Ctrl-C/SIGTERM, or an unhandled crash in orchestrate() -- see main()) so
+    a long unattended run never ends without a clear pass/fail count landing in runner.log/stdout and the
+    trace file, whatever caused it to stop."""
     ok = [p for p in all_pbs if p.status == "success"]
     bad = [p for p in all_pbs if p.status == "failed"]
-    log_event(f"DONE: {len(ok)} passed, {len(bad)} failed, {len(all_pbs)} total")
+    unfinished = [p for p in all_pbs if p.status in ("pending", "running")]
+    label = "INTERRUPTED" if interrupted else "DONE"
+    counts = f"{len(ok)} passed, {len(bad)} failed" + (f", {len(unfinished)} not finished" if unfinished else "") + f", {len(all_pbs)} total"
+    log_event(f"{label}: {counts}")
 
     needs_attention = []
     for p in bad:
-        note = f" -- {p.diagnosis[0]}: {p.diagnosis[1].splitlines()[0][:160]}" if p.diagnosis else " -- no diagnosis triggered"
+        killed = p.rc is not None and p.rc < 0
+        note = f" -- killed (signal {-p.rc})" if killed else \
+               (f" -- {p.diagnosis[0]}: {p.diagnosis[1].splitlines()[0][:160]}" if p.diagnosis else " -- no diagnosis triggered")
         log_event(f"  FAILED {p.name} rc={p.rc}{note}")
         needs_attention.append(f"- **{p.name}** (rc={p.rc}){note} — see `logs/run-{p.name}.out`")
+    for p in unfinished:
+        log_event(f"  NOT FINISHED {p.name} (was {p.status} when the run stopped)")
+        needs_attention.append(f"- **{p.name}** — still `{p.status}` when the run was interrupted, no result; rerun it directly")
     for p in ok:
         if p.diagnosis and any(k in p.diagnosis[1].upper() for k in CONCERN_KEYWORDS):
             needs_attention.append(f"- **{p.name}** (passed, but {p.diagnosis[0]} flagged it) — "
                                     f"{p.diagnosis[1].splitlines()[-1][:200]}")
 
     trace_write(f"""
-## Final summary — {time.strftime('%F %T')}
+## {'Interrupted' if interrupted else 'Final'} summary — {time.strftime('%F %T')}
 
-{len(all_pbs)} total, {len(ok)} passed, {len(bad)} failed.
+{counts}.
 
 ## Needs attention
 
@@ -677,7 +757,7 @@ def tui_main(scr, all_pbs, stop_event):
         counts = collections.Counter(p.status for p in all_pbs)
         put(0, 1, f"oko_runner  {counts['success']} ok  {counts['failed']} failed  "
                   f"{counts['running']} running  {counts['pending']} pending  "
-                  f"{'PAUSED' if paused.is_set() else ''}", curses.A_BOLD)
+                  f"{'PAUSED' if paused.is_set() else ''} {'DISK-PAUSED' if disk_paused.is_set() else ''}", curses.A_BOLD)
         put(0, w - 10, time.strftime("%H:%M:%S"))
 
         list_h = min(len(all_pbs), max(3, h // 2))
@@ -721,6 +801,9 @@ def tui_main(scr, all_pbs, stop_event):
             if not any(p.running for p in all_pbs) or quit_armed:
                 for p in all_pbs:
                     p.kill()
+                deadline = time.time() + 15  # let _watch() threads reap so the summary right after shows real statuses, not stale "running"
+                while time.time() < deadline and any(p.running for p in all_pbs):
+                    time.sleep(0.5)
                 return
             quit_armed = True
             continue
@@ -752,21 +835,39 @@ def main():
     all_pbs = build_first + pool + solo
     stop_event = threading.Event()
 
-    def handle_sigint(signum, frame):
-        log_event("SIGINT: killing all running playbooks")
-        for p in all_pbs:
+    def handle_signal(signum, frame):
+        # `kill <pid>` (RUNNING.md's own documented pattern for stopping a run) sends SIGTERM, not SIGINT --
+        # this used to only catch Ctrl-C, silently orphaning every running playbook process/k3d cluster and
+        # never printing a summary. Both signals now kill everything, wait for that to actually land (kill()
+        # itself is async), and print the same final summary a normal finish would, marked INTERRUPTED.
+        name = signal.Signals(signum).name
+        running = [p for p in all_pbs if p.running]
+        log_event(f"{name} received: killing {len(running)} running playbook(s), writing final summary")
+        for p in running:
             p.kill()
-        sys.exit(130)
+        deadline = time.time() + 15
+        while time.time() < deadline and any(p.running for p in all_pbs):
+            time.sleep(0.5)
+        print_summary(all_pbs, interrupted=True)
+        sys.exit(128 + signum)
 
-    signal.signal(signal.SIGINT, handle_sigint)
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
 
     if HEADLESS:
-        orchestrate(build_first, pool, solo, stop_event)
+        try:
+            orchestrate(build_first, pool, solo, stop_event)
+        except Exception:
+            # deliberately not `except BaseException`: SIGINT/SIGTERM raise SystemExit via handle_signal
+            # above, which already prints its own summary and must propagate untouched to actually exit.
+            log_event("orchestrate() crashed; writing final summary before re-raising")
+            print_summary(all_pbs, interrupted=True)
+            raise
     else:
         import curses
         threading.Thread(target=orchestrate, args=(build_first, pool, solo, stop_event), daemon=True).start()
         curses.wrapper(tui_main, all_pbs, stop_event)
-        print_summary(all_pbs)
+        print_summary(all_pbs, interrupted=any(p.status not in ("success", "failed") for p in all_pbs))
 
 
 if __name__ == "__main__":

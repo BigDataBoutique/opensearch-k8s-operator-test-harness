@@ -45,21 +45,34 @@ def test_operator_steps_put_a_playbook_in_the_solo_group(tmp_path, monkeypatch, 
     build_first, pool, solo = oko_runner.classify([plain, local_install, scaler, killer, upgrader, released, flagged, build])
     assert [p.name for p in build_first] == ["10-build"]
     assert [p.name for p in pool] == ["30-plain", "33-local-install"]
-    assert [p.name for p in solo] == ["34-flagged", "40-killer", "57-released", "63-upgrader", "76-scaler"]
-    assert scaler.solo_reasons == ["scale_operator"] and killer.solo_reasons == ["kill_operator"] and upgrader.solo_reasons == ["upgrade_operator"]
-    assert released.solo_reasons == ["install_operator(version=${OPERATOR_PREV:-2.8.0}, values)"]
+    # "63-upgrader" calls upgrade_operator, so it's auto-detected as a migration playbook (content, not its
+    # number, which deliberately doesn't match any old filename-regex range) and sorts after the others.
+    assert [p.name for p in solo] == ["34-flagged", "40-killer", "57-released", "76-scaler", "63-upgrader"]
+    assert scaler.solo_reasons == ["scale_operator"] and killer.solo_reasons == ["kill_operator"]
+    assert upgrader.solo_reasons == ["migration", "upgrade_operator"] and upgrader.migration
+    assert released.solo_reasons == ["install_operator(version=${OPERATOR_PREV:-2.8.0}, values)"] and not released.migration
     assert flagged.solo_reasons == ["metadata.run_alone"]
     assert plain.solo_reasons == [] and local_install.solo_reasons == []
 
 
+MIGRATION_BODY = PLAIN.replace(
+    "      - action: install_operator\n",
+    '      - action: install_operator\n        params: {version: "${OPERATOR_PREV:-2.8.0}"}\n',
+) + "      - action: upgrade_operator\n        params: {version: local}\n"
+
+
 def test_migration_playbooks_run_after_the_other_solo_ones_in_tested_order(tmp_path):
+    # "51-mig"/"62-mig"/"53-mig" are shaped like the real migration playbooks (non-local install_operator +
+    # upgrade_operator, see playbooks/5*-migration-*.yaml) -- migration is detected from those steps, not
+    # from the "-mig" name, which exists only to make the assertions below readable.
     names = ["53-mig", "76-scaler", "51-mig", "62-mig", "40-chaos", "20-plain"]
-    pbs = [_pb(tmp_path, n, PLAIN + ("      - action: kill_operator\n" if n in ("76-scaler", "40-chaos") else "")) for n in names]
-    _, pool, solo = oko_runner.classify(pbs)
-    assert [p.name for p in pool] == ["20-plain"]
+    pbs = [_pb(tmp_path, n, MIGRATION_BODY if n.endswith("-mig") else PLAIN + ("      - action: kill_operator\n" if n in ("76-scaler", "40-chaos") else "")) for n in names]
+    build_first, pool, solo = oko_runner.classify(pbs)
+    # "20-plain" is the only pool-eligible playbook here, so it becomes build_first rather than sitting in pool
+    assert [p.name for p in build_first] == ["20-plain"] and pool == []
     assert [p.name for p in solo] == ["40-chaos", "76-scaler", "51-mig", "62-mig", "53-mig"]
     assert all(p.migration for p in solo[2:]) and not any(p.migration for p in solo[:2])
-    assert solo[2].solo_reasons == ["migration"]
+    assert solo[2].solo_reasons[0] == "migration"
 
 
 def test_real_playbooks_plan():
@@ -72,4 +85,6 @@ def test_real_playbooks_plan():
     assert "31-scale-and-upgrade-together" in {p.name for p in pool}
     for p in pool:
         assert not oko_runner.operator_steps(p.path), f"{p.name} touches the operator but is in the parallel pool"
-    assert build_first and build_first[0].name.startswith("10-")
+    # build_first is just whichever pool-eligible playbook sorts first -- no naming convention required,
+    # so this checks that invariant directly rather than hardcoding today's answer ("10-basic-3x").
+    assert build_first and all(build_first[0].name < p.name for p in pool)

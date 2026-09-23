@@ -1,6 +1,7 @@
 """Thin kubectl wrapper. Everything the harness needs from Kubernetes goes through here."""
 
 import json
+import random
 import subprocess
 import time
 from typing import Any, Dict, List, Optional
@@ -31,6 +32,24 @@ def kubectl(*args: str, input: Optional[str] = None, check: bool = True, timeout
 
 def current_context() -> str:
     return kubectl("config", "current-context").strip()
+
+
+def switch_context(context: str) -> None:
+    """kubectl config use-context, skipped when already current (the common case once any playbook has
+    switched it) and retried on the transient '~/.kube/config.lock: file exists' race: every playbook is
+    a separate process, and two calling this at the same instant can collide on kubectl's own lockfile,
+    which fails fast instead of waiting (2026-09-23 8-hour run: 2 pool playbooks lost setup_cluster to it)."""
+    if current_context() == context:
+        return
+    for attempt in range(5):
+        try:
+            kubectl("config", "use-context", context)
+            return
+        except KubectlError as e:
+            if "config.lock" in str(e) and attempt < 4:
+                time.sleep(1 + random.random())
+                continue
+            raise
 
 
 def get_json(*args: str) -> Any:
